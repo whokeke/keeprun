@@ -1,6 +1,9 @@
+import { readFile, stat } from "node:fs/promises"
+import { basename, isAbsolute, resolve } from "node:path"
+
 type ModelRef = { providerID: string; modelID: string }
 
-type Phase = "ack" | "plan" | "build"
+type Phase = "ack" | "plan" | "build" | "handoff"
 
 type St = {
   active: boolean
@@ -8,12 +11,18 @@ type St = {
   planModel?: ModelRef
   buildModel?: ModelRef
   task: string
+  goalText: string
+  goalPath?: string
+  goalMtimeMs?: number
+  goalWarned: boolean
   cycles: number
   maxCycles: number
   budgetMs?: number
   deadline?: number
   emptyRounds: number
   challenging: boolean
+  overflowed: boolean
+  handoffs: number
   lastAssistantID?: string
   capturePending: boolean
   restore: boolean
@@ -25,7 +34,12 @@ const PLAN_AGENT = "keeprun-plan"
 const BUILD_AGENT = "build"
 const DEFAULT_MAX_CYCLES = 20
 const CHALLENGER_EMPTY_LIMIT = 5
+const MAX_HANDOFFS = 5
+const GOAL_DOC_CHAR_LIMIT = 16 * 1024
 const WATCHDOG_MS = 30 * 60 * 1000
+
+const CONTEXT_ERROR_RE = /context limit|exceeds the context|context length|too many tokens|maximum context/i
+const HANDOFF_MARK = "KEEPRUN_HANDOFF"
 
 const MARK_START = "KEEPRUN_START"
 const MARK_READY = "KEEPRUN_PLAN_READY"
@@ -78,6 +92,7 @@ function parseArgs(raw: string) {
   let max: number | undefined
   let forMs: number | undefined
   let forInvalid = false
+  let goal: string | undefined
   let task = raw || ""
   task = task.replace(/--plan-model=(\S+)/g, (_, v) => {
     planModel = parseModel(v)
@@ -96,8 +111,12 @@ function parseArgs(raw: string) {
     if (!forMs) forInvalid = true
     return ""
   })
+  task = task.replace(/--goal=(?:"([^"]*)"|'([^']*)'|(\S+))/g, (_, q1, q2, q3) => {
+    goal = q1 !== undefined ? q1 : q2 !== undefined ? q2 : q3
+    return ""
+  })
   task = task.replace(/\s+/g, " ").trim()
-  return { task, planModel, buildModel, max, forMs, forInvalid }
+  return { task, planModel, buildModel, max, forMs, forInvalid, goal }
 }
 
 function unwrap(res: any): any {
@@ -116,6 +135,13 @@ function errText(error: any): string {
   if (error.message) return String(error.message)
   if (error.name) return String(error.name)
   return JSON.stringify(error)
+}
+
+function isContextError(error: any): boolean {
+  if (!error) return false
+  const name = error.name || error.data?.name
+  if (name === "ContextOverflowError") return true
+  return CONTEXT_ERROR_RE.test(errText(error))
 }
 
 function markerOf(text: string): string | undefined {
@@ -145,6 +171,8 @@ export default async function Keeprun(input: any) {
   const envMax = Number(process.env.KEEPRUN_MAX_CYCLES)
   const defaultMax = Number.isFinite(envMax) && envMax > 0 ? envMax : DEFAULT_MAX_CYCLES
   const defaultBudget = parseDuration(process.env.KEEPRUN_FOR)
+  const envGoal = process.env.KEEPRUN_GOAL
+  const directory: string | undefined = input?.directory
 
   async function toast(message: string, variant: "info" | "success" | "warning" | "error" = "info") {
     try {
@@ -271,8 +299,48 @@ export default async function Keeprun(input: any) {
     return fmtDuration(st.deadline - Date.now())
   }
 
+  async function resolveGoal(raw: string | undefined, task: string) {
+    const value = (raw || "").trim()
+    if (!value) return { text: task, path: undefined as string | undefined, mtimeMs: undefined as number | undefined }
+    if (!value.startsWith("@")) return { text: value, path: undefined as string | undefined, mtimeMs: undefined as number | undefined }
+    const rel = value.slice(1)
+    const full = isAbsolute(rel) ? rel : resolve(directory || process.cwd(), rel)
+    try {
+      const [content, info] = await Promise.all([readFile(full, "utf8"), stat(full)])
+      const clipped =
+        content.length > GOAL_DOC_CHAR_LIMIT
+          ? content.slice(0, GOAL_DOC_CHAR_LIMIT) + "\n\n[goal document truncated]"
+          : content
+      return { text: clipped.trim() || task, path: full, mtimeMs: info.mtimeMs }
+    } catch (error) {
+      await toast("goal document not readable: " + rel + " (" + errText(error) + "); falling back to the task text", "warning")
+      return { text: task, path: undefined as string | undefined, mtimeMs: undefined as number | undefined }
+    }
+  }
+
+  async function checkGoalChanged(st: St) {
+    if (!st.goalPath || st.goalWarned) return
+    try {
+      const info = await stat(st.goalPath)
+      if (st.goalMtimeMs !== undefined && info.mtimeMs !== st.goalMtimeMs) {
+        st.goalWarned = true
+        await toast("goal document changed after start; the original goal snapshot stays in effect", "warning")
+      }
+    } catch {}
+  }
+
+  function goalLines(st: St): string[] {
+    return [
+      "",
+      "Ultimate goal:",
+      st.goalText,
+      ...(st.goalPath ? ["Goal source: " + st.goalPath + " (immutable snapshot taken at start; do not modify it)"] : []),
+    ]
+  }
+
   async function sendPlan(sessionID: string, st: St) {
     st.phase = "plan"
+    await checkGoalChanged(st)
     const progress =
       st.cycles === 0
         ? "No build step has run yet."
@@ -282,6 +350,7 @@ export default async function Keeprun(input: any) {
       "KEEPRUN planning phase.",
       "",
       "Task: " + st.task,
+      ...goalLines(st),
       "",
       "State: " + progress,
       ...(left ? ["Time budget remaining: " + left + ". Keep making concrete progress until the budget is exhausted."] : []),
@@ -301,9 +370,11 @@ export default async function Keeprun(input: any) {
     st.phase = "build"
     st.challenging = false
     st.emptyRounds = 0
+    await checkGoalChanged(st)
     const left = timeLeft(st)
     const text = [
       "KEEPRUN build phase.",
+      ...goalLines(st),
       "",
       ...(left ? ["Time budget remaining: " + left + ". Keep making concrete progress until the budget is exhausted."] : []),
       "Execute exactly the next step described in the planner's last message above.",
@@ -320,15 +391,18 @@ export default async function Keeprun(input: any) {
 
   async function sendChallenge(sessionID: string, st: St) {
     st.phase = "plan"
+    await checkGoalChanged(st)
     const left = timeLeft(st) || "unknown"
     const text = [
       "KEEPRUN challenger phase.",
       "",
       "Task: " + st.task,
+      ...goalLines(st),
       "",
       "The previous objective was reported complete (KEEPRUN_DONE), but the time budget still has " + left + " remaining. Do not stop.",
+      "Judge progress against the ULTIMATE GOAL above and keep pushing toward it.",
       "Act as a strict adversarial reviewer of everything done so far in this conversation.",
-      "Interrogate the result: what is untested, fragile, incomplete, slow, insecure, or unclear? What would a demanding reviewer reject? What follow-up work is genuinely valuable?",
+      "Interrogate the result: what is untested, fragile, incomplete, slow, insecure, or unclear? What would a demanding reviewer reject? What follow-up work is genuinely valuable for reaching the ultimate goal?",
       ...(st.emptyRounds > 0
         ? [
             "A previous challenger round also found nothing. Probe harder: this is empty round " +
@@ -348,6 +422,135 @@ export default async function Keeprun(input: any) {
       ...(st.planModel ? { model: st.planModel } : {}),
       parts: [{ type: "text", text }],
     })
+  }
+
+  async function sendHandoff(sessionID: string, st: St) {
+    st.phase = "handoff"
+    await checkGoalChanged(st)
+    const left = timeLeft(st)
+    const text = [
+      "KEEPRUN handoff phase.",
+      "",
+      "This session reached its context limit. Write a handoff document for the NEXT session so keeprun can continue without losing state.",
+      "",
+      "Task: " + st.task,
+      ...goalLines(st),
+      "",
+      "State: " + st.cycles + " build step(s) completed so far.",
+      ...(left ? ["Time budget remaining: " + left + "."] : []),
+      "",
+      "The document must cover:",
+      "1. The ultimate goal (restate it) and the immediate task.",
+      "2. What has been completed and verified so far, with concrete evidence (files, commits, test results).",
+      "3. The in-flight step and its exact state (what is done, what is not).",
+      "4. Next steps in priority order toward the ultimate goal.",
+      "5. Working conventions and gotchas: build/test commands, environment constraints.",
+      "",
+      "Do not do any new work. Plain text only. End with " + HANDOFF_MARK + " on its own final line.",
+    ].join("\n")
+    await dispatch(sessionID, st, {
+      agent: PLAN_AGENT,
+      ...(st.planModel ? { model: st.planModel } : {}),
+      parts: [{ type: "text", text }],
+    })
+  }
+
+  async function fallbackHandoff(sessionID: string, st: St): Promise<string> {
+    const list = await loadMessages(sessionID, 8)
+    const chunks: string[] = []
+    for (const m of list) {
+      const text = (m?.parts || [])
+        .filter((part: any) => part?.type === "text")
+        .map((part: any) => part.text || "")
+        .join(" ")
+        .trim()
+      if (text) chunks.push(String(m?.info?.role || "?") + ": " + text.slice(0, 1200))
+    }
+    return [
+      "Handoff generated by the keeprun plugin (the model-written handoff was unavailable).",
+      "",
+      "Ultimate goal: " + st.goalText,
+      ...(st.goalPath ? ["Goal source: " + st.goalPath] : []),
+      "Task: " + st.task,
+      "Cycles completed: " + st.cycles,
+      ...(st.deadline ? ["Time budget remaining: " + fmtDuration(st.deadline - Date.now())] : []),
+      "",
+      "Recent transcript:",
+      ...chunks,
+    ].join("\n")
+  }
+
+  async function startHandoff(sessionID: string, st: St, compact: boolean) {
+    st.overflowed = false
+    st.handoffs += 1
+    if (st.handoffs > MAX_HANDOFFS) {
+      return await stop(sessionID, st, "too many context handoffs (" + MAX_HANDOFFS + ")")
+    }
+    await toast("context limit reached; preparing handoff (" + st.handoffs + "/" + MAX_HANDOFFS + ")", "info")
+    if (compact) {
+      const model = st.buildModel || st.planModel
+      if (model) {
+        try {
+          const res = await client.session.summarize({
+            path: { id: sessionID },
+            body: { providerID: model.providerID, modelID: model.modelID },
+          })
+          if (failed(res)) throw res.error
+        } catch (error) {
+          await toast("auto-compact failed: " + errText(error) + "; using fallback handoff if needed", "warning")
+        }
+      }
+    }
+    await sendHandoff(sessionID, st)
+  }
+
+  async function migrateToNewSession(oldID: string, st: St, doc: string) {
+    let newID: string | undefined
+    try {
+      const res = await client.session.create({ body: { title: "keeprun: " + st.task.slice(0, 60) } })
+      if (failed(res)) throw res.error
+      newID = unwrap(res)?.id
+      if (!newID) throw new Error("session.create returned no id")
+    } catch (error) {
+      return await stop(oldID, st, "handoff failed: " + errText(error))
+    }
+
+    states.delete(oldID)
+    st.lastAssistantID = undefined
+    st.phase = "plan"
+    st.overflowed = false
+    st.processing = false
+    clearWatchdog(st)
+    states.set(newID, st)
+    await setPermissions(newID, HARDEN)
+
+    const contextText = [
+      "KEEPRUN handoff context from the previous session (that session hit its context limit).",
+      "",
+      "Task: " + st.task,
+      ...goalLines(st),
+      ...(st.deadline ? ["", "Time budget remaining: " + fmtDuration(st.deadline - Date.now()) + "."] : []),
+      "",
+      "Handoff document:",
+      doc,
+    ].join("\n")
+    try {
+      await client.session.promptAsync({
+        path: { id: newID },
+        body: {
+          agent: BUILD_AGENT,
+          ...(st.buildModel ? { model: st.buildModel } : {}),
+          noReply: true,
+          parts: [{ type: "text", text: contextText, synthetic: true }],
+        },
+      })
+    } catch {}
+
+    await sendPlan(newID, st)
+    await toast("keeprun handed off to a new session: " + newID + " (" + st.handoffs + "/" + MAX_HANDOFFS + ")", "success")
+    try {
+      await restoreSession(oldID, st, "KEEPRUN continued in a new session " + newID + " (context refreshed).")
+    } catch {}
   }
 
   async function onIdle(sessionID: string) {
@@ -386,9 +589,18 @@ export default async function Keeprun(input: any) {
         if (name === "ProviderAuthError") return await stop(sessionID, st, "provider auth error")
         if (name === "MessageOutputLengthError") {
           if (st.phase === "plan") return await stop(sessionID, st, "planner output truncated")
+        } else if (isContextError(error)) {
+          if (st.phase === "handoff") {
+            return await migrateToNewSession(sessionID, st, await fallbackHandoff(sessionID, st))
+          }
+          return await startHandoff(sessionID, st, true)
         } else {
           return await stop(sessionID, st, "assistant error: " + (name || "unknown"))
         }
+      }
+
+      if (st.overflowed) {
+        return await startHandoff(sessionID, st, false)
       }
 
       const text = (last.parts || [])
@@ -396,6 +608,21 @@ export default async function Keeprun(input: any) {
         .map((part: any) => part.text || "")
         .join("\n")
       const mark = markerOf(text)
+
+      if (st.phase === "handoff") {
+        const doc = text
+          .split(/\r?\n/)
+          .filter(
+            (line) =>
+              line
+                .trim()
+                .replace(/^[>*#`_\-\s]+/, "")
+                .replace(/[`_*\s]+$/, "") !== HANDOFF_MARK,
+          )
+          .join("\n")
+          .trim()
+        return await migrateToNewSession(sessionID, st, doc || (await fallbackHandoff(sessionID, st)))
+      }
 
       if (st.phase === "ack") {
         await sendPlan(sessionID, st)
@@ -469,6 +696,8 @@ export default async function Keeprun(input: any) {
       const budgetMs = parsed.forMs ?? defaultBudget
       const explicitMax = parsed.max && parsed.max > 0 ? parsed.max : undefined
       const maxCycles = explicitMax ?? (budgetMs ? Infinity : defaultMax)
+      const taskText = parsed.task || "(continue the current conversation task)"
+      const goal = await resolveGoal(parsed.goal ?? envGoal, taskText)
       const previous = states.get(sessionID)
       if (previous) clearWatchdog(previous)
       const st: St = {
@@ -476,13 +705,19 @@ export default async function Keeprun(input: any) {
         phase: "ack",
         planModel: parsed.planModel || defaultPlanModel,
         buildModel: parsed.buildModel,
-        task: parsed.task || "(continue the current conversation task)",
+        task: taskText,
+        goalText: goal.text,
+        goalPath: goal.path,
+        goalMtimeMs: goal.mtimeMs,
+        goalWarned: false,
         cycles: 0,
         maxCycles,
         budgetMs,
         deadline: budgetMs ? Date.now() + budgetMs : undefined,
         emptyRounds: 0,
         challenging: false,
+        overflowed: false,
+        handoffs: 0,
         capturePending: true,
         restore: false,
         processing: false,
@@ -506,7 +741,11 @@ export default async function Keeprun(input: any) {
       const capLabel =
         budgetMs && !explicitMax ? "no cycle cap" : "max " + st.maxCycles + " cycles"
       const budgetLabel = budgetMs ? ", " + fmtDuration(budgetMs) + " budget" : ""
-      await toast("keeprun active (plan " + planLabel + ", " + capLabel + budgetLabel + ")", "success")
+      const goalLabel = st.goalPath ? ", goal " + basename(st.goalPath) : ""
+      await toast(
+        "keeprun active (plan " + planLabel + ", " + capLabel + budgetLabel + goalLabel + ")",
+        "success",
+      )
     },
 
     "chat.message": async (hook: any, output: any) => {
@@ -533,6 +772,13 @@ export default async function Keeprun(input: any) {
           if (!props.sessionID) return
           const st = states.get(props.sessionID)
           if (!st || !st.active) return
+          if (isContextError(props.error)) {
+            if (!st.overflowed) {
+              st.overflowed = true
+              await toast("context overflow; compacting, handoff after this round", "info")
+            }
+            return
+          }
           await stop(props.sessionID, st, "session error: " + errText(props.error))
           return
         }

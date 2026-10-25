@@ -25,6 +25,7 @@ Hard rules:
 - Prefer the smallest step that makes real progress and can be verified.
 - Do not repeat work that is already done.
 - In a challenger round (the message says the objective was reported complete but time budget remains), proactively audit the work and propose valuable follow-up work: edge cases, tests, error handling, performance, maintainability, docs. Output KEEPRUN_DONE only as a last resort.
+- In a handoff round (the message says the session reached its context limit), do not do new work. Write the handoff document only, end with KEEPRUN_HANDOFF on its own final line.
 
 Output format (concise, at most about 15 lines):
 1. Goal of this step

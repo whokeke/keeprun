@@ -30,6 +30,8 @@ opencode 原生在每一轮 assistant 回复结束后进入 `idle`，等待用�
 | 停止条件 | 完成标记 + 最大轮数（默认 20）；可选时间预算 `--for=8h` |
 | 时间预算 | `--for=<时长>`（`30s`/`45m`/`8h`/`1d`/`1h30m`）；设预算即默认解除轮数上限 |
 | 完成后续跑 | 预算未耗尽时 `KEEPRUN_DONE` 触发**追问者（challenger）轮**，由强模型审查并挖掘新任务 |
+| 最终目标 | `--goal="文本"` 或 `--goal=@goal.md`（文档，相对 worktree，16KB 截断）；启动时快照，运行中不允许修改（改动仅告警，不改变目标） |
+| 上下文溢出 | 识别 `ContextOverflowError`/溢出文本 → 自动 compact → 强模型写交接文档 → **新建 session** 继续同一 keeprun（`MAX_HANDOFFS=5`） |
 | 规划模型 | 默认 `deepseek/GLM-5.3`，可通过参数/环境变量/agent 文件修改 |
 | 实施阶段 | 内置 `build` agent + `/keeprun` 前的**原模型** |
 | 零打断加固 | `doom_loop: allow` + `question: deny`（keeprun 会话级） |
@@ -156,20 +158,26 @@ const taskModel =
 ### 5.1 状态
 
 ```ts
-type Phase = "ack" | "plan" | "build"
+type Phase = "ack" | "plan" | "build" | "handoff"
 
 type St = {
   active: boolean
   phase: Phase
-  planModel?: ModelRef      // 未指定时交由 agent frontmatter 决定
-  buildModel?: ModelRef     // /keeprun 前的原模型
+  planModel?: ModelRef
+  buildModel?: ModelRef
   task: string
+  goalText: string          // 最终目标文本（缺省为任务文本）
+  goalPath?: string         // --goal=@file 的绝对路径
+  goalMtimeMs?: number      // 启动时快照的 mtime；变化只告警不改目标
+  goalWarned: boolean
   cycles: number
   maxCycles: number         // 设了时间预算且未显式 --max 时为 Infinity
   budgetMs?: number         // 时间预算总长
   deadline?: number         // epoch ms；Date.now() >= deadline 即到期
   emptyRounds: number       // 追问者连续空手轮数
   challenging: boolean      // 当前是否处于追问者轮
+  overflowed: boolean       // 收到 ContextOverflowError，待本轮结束后交接
+  handoffs: number          // 已执行交接次数
   lastAssistantID?: string  // 去重
   capturePending: boolean    // 等待捕获原模型
   restore: boolean           // /keepstop 后待恢复
@@ -181,10 +189,11 @@ type St = {
 ### 5.2 完整时序
 
 ```
-用户：/keeprun <task> [--plan-model=...] [--build-model=...] [--max=N] [--for=8h]
+用户：/keeprun <task> [--plan-model=...] [--build-model=...] [--max=N] [--for=8h] [--goal=...]
   │
   ├─ command.execute.before
   │    ├─ 解析参数、剥离 flag（含时长解析，非法值告警忽略）
+  │    ├─ 解析最终目标：内联文本或 @文档（启动时读一次快照，16KB 截断）
   │    ├─ 有 --for 且无显式 --max → maxCycles = ∞；deadline = now + 时长
   │    ├─ 会话级加固：session.permission += {doom_loop:allow, question:deny}
   │    ├─ 状态 phase = "ack"
@@ -221,9 +230,16 @@ type St = {
        │    └─ 预算未耗尽     → 追问者轮
        ├─ cycles++ ≥ max → 停止（触顶；有预算且无显式 --max 时 max=∞）
        └─ 否则          → 回到 plan 轮
+
+上下文溢出（同时满足任一路径）：
+  A. session.error 为 ContextOverflowError → 只置 overflowed=true（opencode 自动 compact 并续完本轮）
+  B. assistant error 为 ContextOverflowError 或文本匹配溢出 → 直接进入交接（先 summarize 压缩）
+  → idle 时若 overflowed / 进入交接 → handoff 轮（keeprun-plan 写交接文档，结尾 KEEPRUN_HANDOFF）
+  → 捕获文档 → session.create 新会话 → HARDEN + noReply 注入交接文档 → 新会话继续 plan 轮
+  → 旧会话 UNHARDEN 并留迁移提示；deadline/cycles/models/goal 快照全部携带；handoffs > 5 停止
 ```
 
-每轮 idle 都会先检查 `Date.now() >= deadline`；plan/build 提示词中附带剩余时间，让模型感知预算节奏。
+每轮 idle 都会先检查 `Date.now() >= deadline`；plan/build 提示词中附带剩余时间与最终目标，让模型感知预算与方向。
 
 ### 5.3 为什么有 ack 轮
 
@@ -250,11 +266,16 @@ type St = {
 
 | 函数 | 说明 |
 |---|---|
-| `parseArgs` | 解析 `--plan-model=`、`--build-model=`、`--max=`、`--for=`，并从任务文本中剥离 |
+| `parseArgs` | 解析 `--plan-model=`、`--build-model=`、`--max=`、`--for=`、`--goal=`（支持引号与 `@file`），并从任务文本中剥离 |
 | `parseModel` | `provider/model` → `{providerID, modelID}` |
 | `parseDuration` / `fmtDuration` | 时长字符串 ↔ 毫秒（`8h`/`1h30m`/`45m`），用于预算与剩余时间展示 |
-| `sendChallenge` | 追问者轮：仍走 `keeprun-plan` agent，提示词切换为对抗式审查并要求挖出新任务 |
+| `resolveGoal` / `checkGoalChanged` | 启动时读取目标（内联或 `@文档`，相对 worktree），运行中仅检测 mtime 变化并告警，不改快照 |
+| `sendChallenge` | 追问者轮：仍走 `keeprun-plan` agent，提示词切换为对抗式审查并要求对照最终目标挖出新任务 |
 | `timeLeft` | 剩余预算格式化，供提示词与 toast 使用 |
+| `isContextError` | `name === "ContextOverflowError"` 或错误文本匹配溢出模式 |
+| `sendHandoff` / `fallbackHandoff` | 让强模型写交接文档；模型轮失败时用最近对话生成兜底文档 |
+| `startHandoff` | 计数与上限检查；需要时先 `session.summarize` 压缩，再派发 handoff 轮 |
+| `migrateToNewSession` | `session.create` 新会话、迁移状态、HARDEN、注入交接上下文并继续 plan 轮 |
 | `setPermissions` | 调 `client.session.update({body:{permission:[...]}})`；SDK 类型偏旧，使用 `as any` |
 | `loadMessages` / `lastAssistant` / `lastUserModel` | 读取最近消息、最后 assistant、最后 user 的模型 |
 | `sendPlan` | 设置 `phase=plan`，注入规划消息 |
@@ -274,6 +295,7 @@ type St = {
 | `KEEPRUN_DONE` | plan/build 轮 | 整个任务完成并验证 |
 | `KEEPRUN_BLOCKED: <question>` | plan 轮 | 确需用户决策，停止 |
 | `KEEPRUN_CONTINUE` | build 轮 | 本步完成但任务未结束（插件即使没看到也默认继续） |
+| `KEEPRUN_HANDOFF` | handoff 轮 | 交接文档结束标记（插件也会直接取该轮文本作为文档） |
 
 判定规则（`markerOf`）：
 
@@ -301,6 +323,8 @@ type St = {
 - 最大轮数：每次 build 完成 `cycles++`；`cycles >= maxCycles` 停止。未显式 `--max` 而设了 `--for` 时 `maxCycles = Infinity`。
 - 时间预算：每次 idle 先检查 `Date.now() >= deadline`，到期停止（`time budget exhausted`）。
 - 完成但预算未耗尽：`KEEPRUN_DONE` 不停止，转入追问者轮；追问者连续 5 轮（`CHALLENGER_EMPTY_LIMIT`）仍无产出才停止（`challenger found no further work`），防止空转烧 token。
+- 上下文溢出：`ContextOverflowError` 事件只标记不停止（opencode 自动 compact 并继续）；ai 消息上的溢出错误触发一次 compact 后交接；交接最多 5 次（`MAX_HANDOFFS`），超出停止（`too many context handoffs`）。
+- 交接失败（`session.create` 失败）→ 停止并提示；旧会话始终解除加固并提示新会话 id。
 - 手动 `/keepstop`：置 `active=false, restore=true`，在随后的 idle 恢复。
 
 ### 6.5 会话级“零打断”加固
@@ -412,7 +436,10 @@ KEEPRUN is being stopped. Confirm in one short sentence and do not start new wor
 | 实施模型 | `/keeprun` 前的原模型 | `/keeprun --build-model=provider/model` 覆盖 |
 | 最大循环 | 20 | `/keeprun --max=N`；或环境变量 `KEEPRUN_MAX_CYCLES` |
 | 时间预算 | 无 | `/keeprun --for=8h`；或环境变量 `KEEPRUN_FOR`；设预算后默认解除轮数上限 |
+| 最终目标 | 任务文本 | `--goal="文本"` / `--goal=@goal.md`；或环境变量 `KEEPRUN_GOAL`；启动快照，运行中不改 |
+| 目标文档截断 | 16KB | 常量 `GOAL_DOC_CHAR_LIMIT` |
 | 追问者空转上限 | 5 | 代码常量 `CHALLENGER_EMPTY_LIMIT` |
+| 交接次数上限 | 5 | 代码常量 `MAX_HANDOFFS` |
 | 看门狗 | 30 分钟 | 代码常量 `WATCHDOG_MS` |
 
 优先级：命令行参数 > 环境变量 > agent frontmatter。
@@ -433,6 +460,8 @@ KEEPRUN is being stopped. Confirm in one short sentence and do not start new wor
 6. **用户手动插话**：循环期间用户消息会被当前 run 吸收；下一轮仍会切回 keeprun 的 agent/model。需要退出请 `/keepstop`。
 7. **状态仅存内存**：重启 opencode 后需重新 `/keeprun`。
 8. **需重启生效**：插件/命令在启动时加载，当前正在运行的会话不会热加载。
+9. **交接后的新会话**：keeprun 通过 API 驱动新会话，但 TUI 需手动切换过去查看；旧会话会留一条含新会话 id 的迁移提示。
+10. **目标文档不可变**：`--goal=@file` 在启动时快照；运行中修改文件只告警、不改变目标。需要换目标时先 `/keepstop` 再重新 `/keeprun`。
 
 ---
 
@@ -473,6 +502,10 @@ opencode debug config
 - 预算耗尽 → `time budget exhausted` 停止；
 - 追问者连续 5 次空手 → `challenger found no further work` 停止；
 - 有预算时 `KEEPRUN_BLOCKED` 仍立即停止。
+- `--goal` 内联/引号/`@文档`（临时文件）解析、缺失回退任务文本、运行中修改只告警不改目标；
+- `ContextOverflowError` 事件只标记不停止；
+- 溢出错误 → compact（`session.summarize`）→ handoff 轮 → `session.create` 新会话迁移（状态/deadline/goal 保留、旧会话解除加固）；
+- handoff 轮再溢出 → 兜底文档仍完成迁移；`MAX_HANDOFFS` 触顶停止。
 
 全部通过。仓库内测试：`node test/state-machine.test.mjs`。
 
