@@ -117,17 +117,24 @@ function harness() {
 }
 
 async function start(h, args, opts = {}) {
-  const prevSummary = process.env.KEEPRUN_SUMMARY
-  const prevOut = process.env.KEEPRUN_OUT
+  const saved = {}
+  for (const key of ["KEEPRUN_SUMMARY", "KEEPRUN_OUT", "KEEPRUN_RETRY_MS", "KEEPRUN_AGGRESSIVE", "KEEPRUN_MAX_CYCLES"]) {
+    saved[key] = process.env[key]
+  }
   process.env.KEEPRUN_SUMMARY = opts.summary ? "on" : "off"
+  process.env.KEEPRUN_RETRY_MS = String(opts.retryMs ?? 50)
   if (opts.out) process.env.KEEPRUN_OUT = opts.out
   else delete process.env.KEEPRUN_OUT
+  if (opts.aggressiveEnv) process.env.KEEPRUN_AGGRESSIVE = "1"
+  else delete process.env.KEEPRUN_AGGRESSIVE
+  if (opts.maxCyclesEnv) process.env.KEEPRUN_MAX_CYCLES = String(opts.maxCyclesEnv)
+  else delete process.env.KEEPRUN_MAX_CYCLES
   h.instance = await plugin({ client: h.client, directory: opts.directory || process.cwd() })
   h.output = { parts: [{ type: "text", text: "placeholder" }] }
-  if (prevSummary === undefined) delete process.env.KEEPRUN_SUMMARY
-  else process.env.KEEPRUN_SUMMARY = prevSummary
-  if (prevOut === undefined) delete process.env.KEEPRUN_OUT
-  else process.env.KEEPRUN_OUT = prevOut
+  for (const [key, value] of Object.entries(saved)) {
+    if (value === undefined) delete process.env[key]
+    else process.env[key] = value
+  }
   await h.instance["command.execute.before"](
     { command: "keeprun", sessionID: "s1", arguments: args },
     h.output,
@@ -620,6 +627,120 @@ await check("invalid --watchdog warns and is stripped from the task", async () =
   await start(h, "do X --watchdog=8")
   assert.ok(h.toasts.some((t) => /invalid --watchdog/.test(String(t.message))))
   assert.doesNotMatch(promptText({ parts: h.output.parts }), /--watchdog/)
+})
+
+await check("cycles are unlimited by default", async () => {
+  const h = harness()
+  await start(h, "do X")
+  assistant(h, "KEEPRUN_START")
+  await idle(h)
+  for (let i = 0; i < 25; i++) {
+    assistant(h, "KEEPRUN_PLAN_READY")
+    await idle(h)
+    assistant(h, "KEEPRUN_CONTINUE")
+    await idle(h)
+  }
+  assert.equal(stopped(h), false)
+  assert.ok(!h.toasts.some((t) => /max cycles/.test(String(t.message))))
+})
+
+await check("KEEPRUN_MAX_CYCLES env still caps the loop", async () => {
+  const h = harness()
+  await start(h, "do X", { maxCyclesEnv: 2 })
+  assistant(h, "KEEPRUN_START")
+  await idle(h)
+  for (let i = 0; i < 3; i++) {
+    assistant(h, "KEEPRUN_PLAN_READY")
+    await idle(h)
+    assistant(h, "KEEPRUN_CONTINUE")
+    await idle(h)
+    if (stopped(h)) break
+  }
+  assert.match(String(lastToast(h).message), /stopped: max cycles reached \(2\)/)
+})
+
+await check("aggressive mode continues after BLOCKED", async () => {
+  const h = harness()
+  await start(h, "do X --aggressive")
+  assert.doesNotMatch(promptText({ parts: h.output.parts }), /--aggressive/)
+  assistant(h, "KEEPRUN_START")
+  await idle(h)
+  assistant(h, "KEEPRUN_BLOCKED: need credentials")
+  await idle(h)
+  assert.equal(stopped(h), false)
+  assert.ok(h.toasts.some((t) => /aggressive: NOT stopping/.test(String(t.message))))
+  await new Promise((resolve) => setTimeout(resolve, 150))
+  assert.match(promptText(lastPromptBody(h)), /Aggressive mode is ON/)
+  assert.match(promptText(lastPromptBody(h)), /Previous stop condition: needs human decision/)
+})
+
+await check("aggressive mode survives assistant errors", async () => {
+  const h = harness()
+  await start(h, "do X --aggressive")
+  assistant(h, "KEEPRUN_START")
+  await idle(h)
+  assistantError(h, { name: "APIError", data: { message: "boom" } })
+  await idle(h)
+  assert.equal(stopped(h), false)
+  await new Promise((resolve) => setTimeout(resolve, 150))
+  assert.match(promptText(lastPromptBody(h)), /Aggressive mode is ON/)
+  assert.match(promptText(lastPromptBody(h)), /assistant error: APIError/)
+})
+
+await check("aggressive mode survives watchdog silence", async () => {
+  const h = harness()
+  await start(h, "do X --aggressive --watchdog=1s")
+  assistant(h, "KEEPRUN_START")
+  await idle(h)
+  await new Promise((resolve) => setTimeout(resolve, 1300))
+  assert.equal(stopped(h), false)
+  assert.ok(h.toasts.some((t) => /aggressive: NOT stopping \(watchdog/.test(String(t.message))))
+  await new Promise((resolve) => setTimeout(resolve, 150))
+  assert.match(promptText(lastPromptBody(h)), /Aggressive mode is ON/)
+})
+
+await check("aggressive mode ignores --max", async () => {
+  const h = harness()
+  await start(h, "do X --aggressive --max=1")
+  assistant(h, "KEEPRUN_START")
+  await idle(h)
+  for (let i = 0; i < 3; i++) {
+    assistant(h, "KEEPRUN_PLAN_READY")
+    await idle(h)
+    assistant(h, "KEEPRUN_CONTINUE")
+    await idle(h)
+  }
+  assert.equal(stopped(h), false)
+})
+
+await check("aggressive mode still stops at the time budget", async () => {
+  const h = harness()
+  await start(h, "do X --aggressive --for=1s")
+  fakeNow += 2000
+  assistant(h, "KEEPRUN_START")
+  await idle(h)
+  assert.match(String(lastToast(h).message), /stopped: time budget exhausted/)
+})
+
+await check("aggressive mode still honors /keepstop", async () => {
+  const h = harness()
+  await start(h, "do X --aggressive")
+  assistant(h, "KEEPRUN_START")
+  await idle(h)
+  await h.instance["command.execute.before"]({ command: "keepstop", sessionID: "s1", arguments: "" }, { parts: [] })
+  assistant(h, "round done")
+  await idle(h)
+  assert.match(String(lastToast(h).message), /stopped: stopped by user/)
+})
+
+await check("KEEPRUN_AGGRESSIVE env enables aggressive mode", async () => {
+  const h = harness()
+  await start(h, "do X", { aggressiveEnv: true })
+  assistant(h, "KEEPRUN_START")
+  await idle(h)
+  assistant(h, "KEEPRUN_BLOCKED: x")
+  await idle(h)
+  assert.equal(stopped(h), false)
 })
 
 await rm(goalDir, { recursive: true, force: true })

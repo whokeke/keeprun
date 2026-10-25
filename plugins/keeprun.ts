@@ -17,6 +17,9 @@ type St = {
   goalWarned: boolean
   startedAt: number
   watchdogMs: number
+  aggressive: boolean
+  retries: number
+  retryTimer?: ReturnType<typeof setTimeout>
   outDir?: string
   summaryOn: boolean
   summarizing: boolean
@@ -40,7 +43,7 @@ type St = {
 
 const PLAN_AGENT = "keeprun-plan"
 const BUILD_AGENT = "build"
-const DEFAULT_MAX_CYCLES = 20
+const DEFAULT_MAX_CYCLES = Infinity
 const CHALLENGER_EMPTY_LIMIT = 5
 const MAX_HANDOFFS = 5
 const GOAL_DOC_CHAR_LIMIT = 16 * 1024
@@ -107,6 +110,11 @@ function parseArgs(raw: string) {
   let goal: string | undefined
   let out: string | undefined
   let task = raw || ""
+  let aggressive = false
+  if (/--aggressive(?:=\S*)?(\s|$)/.test(task)) {
+    aggressive = true
+    task = task.replace(/--aggressive(?:=\S*)?\s*/g, "")
+  }
   task = task.replace(/--plan-model=(\S+)/g, (_, v) => {
     planModel = parseModel(v)
     return ""
@@ -138,7 +146,7 @@ function parseArgs(raw: string) {
     return ""
   })
   task = task.replace(/\s+/g, " ").trim()
-  return { task, planModel, buildModel, max, forMs, forInvalid, watchdogMs, watchdogInvalid, goal, out }
+  return { task, planModel, buildModel, max, forMs, forInvalid, watchdogMs, watchdogInvalid, goal, out, aggressive }
 }
 
 function unwrap(res: any): any {
@@ -199,6 +207,11 @@ export default async function Keeprun(input: any) {
   const summaryDisabled = ["0", "off", "false", "no"].includes(
     (process.env.KEEPRUN_SUMMARY || "").trim().toLowerCase(),
   )
+  const envAggressive = ["1", "on", "true", "yes"].includes(
+    (process.env.KEEPRUN_AGGRESSIVE || "").trim().toLowerCase(),
+  )
+  const envRetry = Number(process.env.KEEPRUN_RETRY_MS)
+  const retryBaseMs = Number.isFinite(envRetry) && envRetry > 0 ? envRetry : 2000
   const directory: string | undefined = input?.directory
 
   async function toast(message: string, variant: "info" | "success" | "warning" | "error" = "info") {
@@ -256,6 +269,13 @@ export default async function Keeprun(input: any) {
     if (st.watchdog) {
       clearTimeout(st.watchdog)
       st.watchdog = undefined
+    }
+  }
+
+  function clearRetry(st: St) {
+    if (st.retryTimer) {
+      clearTimeout(st.retryTimer)
+      st.retryTimer = undefined
     }
   }
 
@@ -381,9 +401,49 @@ export default async function Keeprun(input: any) {
     return chunks.length ? "Recent transcript:\n" + chunks.join("\n") : "Recent transcript: (unavailable)"
   }
 
+  function aggressiveAllowsStop(reason: string): boolean {
+    return (
+      /^time budget exhausted/.test(reason) ||
+      /^stopped by user/.test(reason) ||
+      /^session deleted/.test(reason)
+    )
+  }
+
+  async function keepGoing(sessionID: string, st: St, reason: string) {
+    if (st.retryTimer) return
+    st.retries += 1
+    if (/too many context handoffs/.test(reason)) st.handoffs = 0
+    const wait = Math.min(60000, retryBaseMs * Math.pow(2, Math.min(st.retries - 1, 5)))
+    await toast(
+      "aggressive: NOT stopping (" + reason + "); continuation #" + st.retries + " in " + fmtDuration(wait),
+      "warning",
+    )
+    st.retryTimer = setTimeout(() => {
+      st.retryTimer = undefined
+      const current = states.get(sessionID)
+      if (!current || current !== st || !current.active || current.summarizing) return
+      if (current.deadline && Date.now() >= current.deadline) {
+        stop(sessionID, current, "time budget exhausted (" + fmtDuration(current.budgetMs || 0) + ")").catch(() => {})
+        return
+      }
+      const note = [
+        "Aggressive mode is ON: the previous stop condition must NOT end this run.",
+        "Previous stop condition: " + reason + ".",
+        "Do not stop, do not ask the user, and do not output KEEPRUN_BLOCKED.",
+        "Assume reasonable defaults, avoid or work around the failed/blocked path, record the assumption, and propose the next actionable step.",
+      ].join("\n")
+      sendPlan(sessionID, current, note).catch(() => {})
+    }, wait)
+  }
+
   async function stop(sessionID: string, st: St, reason: string) {
     if (states.get(sessionID) !== st) return
-    if (st.active && !st.summarizing && st.summaryOn) {
+    if (st.summarizing) return await finishStop(sessionID, st, reason)
+    if (st.aggressive && st.active && !aggressiveAllowsStop(reason)) {
+      return await keepGoing(sessionID, st, reason)
+    }
+    clearRetry(st)
+    if (st.active && st.summaryOn) {
       st.summarizing = true
       st.stopReason = reason
       await sendSummary(sessionID, st, reason)
@@ -397,6 +457,7 @@ export default async function Keeprun(input: any) {
     states.delete(sessionID)
     st.active = false
     clearWatchdog(st)
+    clearRetry(st)
     const finalReason = st.stopReason || reason
     if (st.summaryOn && !st.summaryPath) {
       const body =
@@ -475,7 +536,7 @@ export default async function Keeprun(input: any) {
     ]
   }
 
-  async function sendPlan(sessionID: string, st: St) {
+  async function sendPlan(sessionID: string, st: St, note?: string) {
     st.phase = "plan"
     await checkGoalChanged(st)
     const progress =
@@ -491,6 +552,7 @@ export default async function Keeprun(input: any) {
       "",
       "State: " + progress,
       ...(left ? ["Time budget remaining: " + left + ". Keep making concrete progress until the budget is exhausted."] : []),
+      ...(note ? ["", note] : []),
       "",
       "Produce the single next concrete step that requires no user decision.",
       "You are read-only: do not modify anything and do not ask questions.",
@@ -746,6 +808,7 @@ export default async function Keeprun(input: any) {
       if (!id || id === st.lastAssistantID) return
       st.lastAssistantID = id
       clearWatchdog(st)
+      clearRetry(st)
 
       if (st.deadline && Date.now() >= st.deadline && st.phase !== "summary") {
         return await stop(sessionID, st, "time budget exhausted (" + fmtDuration(st.budgetMs || 0) + ")")
@@ -883,6 +946,7 @@ export default async function Keeprun(input: any) {
           return
         }
         st.pendingStop = "stopped by user (/keepstop)"
+        clearRetry(st)
         await toast("keeprun stopping after this round; docs will be written on exit", "info")
         return
       }
@@ -898,9 +962,13 @@ export default async function Keeprun(input: any) {
       }
       const budgetMs = parsed.forMs ?? defaultBudget
       const watchdogMs = parsed.watchdogMs ?? defaultWatchdog
+      const aggressive = parsed.aggressive || envAggressive
       const explicitMax = parsed.max && parsed.max > 0 ? parsed.max : undefined
-      const maxCycles = explicitMax ?? (budgetMs ? Infinity : defaultMax)
+      const maxCycles = aggressive ? Infinity : explicitMax ?? defaultMax
       const taskText = parsed.task || "(continue the current conversation task)"
+      if (aggressive && !budgetMs) {
+        await toast("aggressive mode without --for: the run continues until /keepstop", "warning")
+      }
       const goal = await resolveGoal(parsed.goal ?? envGoal, taskText)
 
       let outDir: string | undefined
@@ -928,6 +996,8 @@ export default async function Keeprun(input: any) {
         goalWarned: false,
         startedAt: Date.now(),
         watchdogMs,
+        aggressive,
+        retries: 0,
         outDir,
         summaryOn: outDir ? true : !summaryDisabled,
         summarizing: false,
@@ -976,13 +1046,13 @@ export default async function Keeprun(input: any) {
       const planLabel = st.planModel
         ? st.planModel.providerID + "/" + st.planModel.modelID
         : "agent default"
-      const capLabel =
-        budgetMs && !explicitMax ? "no cycle cap" : "max " + st.maxCycles + " cycles"
+      const capLabel = st.maxCycles === Infinity ? "no cycle cap" : "max " + st.maxCycles + " cycles"
       const budgetLabel = budgetMs ? ", " + fmtDuration(budgetMs) + " budget" : ""
       const goalLabel = st.goalPath ? ", goal " + basename(st.goalPath) : ""
       const docsLabel = st.outDir ? ", docs " + st.outDir : ""
+      const aggressiveLabel = st.aggressive ? ", AGGRESSIVE" : ""
       await toast(
-        "keeprun active (plan " + planLabel + ", " + capLabel + budgetLabel + goalLabel + docsLabel + ")",
+        "keeprun active (plan " + planLabel + ", " + capLabel + budgetLabel + goalLabel + docsLabel + aggressiveLabel + ")",
         "success",
       )
     },
@@ -1033,6 +1103,7 @@ export default async function Keeprun(input: any) {
           const st = states.get(id)
           if (st) {
             clearWatchdog(st)
+            clearRetry(st)
             states.delete(id)
             if (st.summaryOn && !st.summaryPath) {
               const reason = st.stopReason || "session deleted"

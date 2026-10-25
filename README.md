@@ -2,7 +2,9 @@
 
 Session-level auto-continue loop for [opencode](https://github.com/anomalyco/opencode) (verified on v1.17.13).
 
-`/keeprun <task>` alternates a **read-only planning phase** (strong model) with a **build phase** (the original model), one concrete step at a time, until the task is done, blocked, or `--max` cycles are reached. `/keepstop` stops the loop and restores the session.
+`/keeprun <task>` alternates a **read-only planning phase** (strong model) with a **build phase** (the original model), one concrete step at a time, until the task is done or stopped. Cycles are **unlimited by default**; `/keepstop` stops the loop and restores the session.
+
+`--aggressive` is the one-flag "never stop" mode: it only ends when the `--for` budget is exhausted or you run `/keepstop`. Blockers, planner errors, provider errors and silent-session watchdogs no longer stop the run — keeprun retries with backoff and re-plans with an explicit "work around it, assume reasonable defaults" directive.
 
 With `--for=8h` the loop becomes time-boxed instead: it keeps going for up to the given duration, and when the model reports the objective complete it enters a **challenger round** — an adversarial reviewer pass that digs up the next valuable task (edge cases, tests, error handling, performance, maintainability, docs) instead of stopping.
 
@@ -46,13 +48,16 @@ curl -fsSL https://raw.githubusercontent.com/whokeke/keeprun/main/uninstall.sh |
 |---|---|---|
 | `--plan-model=provider/model` | `deepseek/GLM-5.3` (in `agents/keeprun-plan.md`) | or `KEEPRUN_PLAN_MODEL` |
 | `--build-model=provider/model` | model active before `/keeprun` | overrides auto-capture |
-| `--max=N` | 20 | or `KEEPRUN_MAX_CYCLES` |
-| `--for=<duration>` | none | `30s` / `45m` / `8h` / `1d` / `1h30m`; or `KEEPRUN_FOR`. Lifts the cycle cap; `KEEPRUN_DONE` triggers a challenger round while time remains |
+| `--max=N` | unlimited | or `KEEPRUN_MAX_CYCLES`. Only needed if you want an explicit cap |
+| `--for=<duration>` | none | `30s` / `45m` / `8h` / `1d` / `1h30m`; or `KEEPRUN_FOR`. `KEEPRUN_DONE` triggers a challenger round while time remains; the only automatic stop in aggressive mode |
+| `--aggressive` | off | or `KEEPRUN_AGGRESSIVE=1`. Never stop except at the `--for` deadline or `/keepstop`: BLOCKED, errors, max-cycles and watchdog are retried/continued (with exponential backoff, `KEEPRUN_RETRY_MS`, default 2s) |
 | `--goal="text"` / `--goal=@file.md` | the task text | or `KEEPRUN_GOAL`. `@` reads a goal document (relative to the worktree, capped at 16 KB); it is snapshotted at start and must not change during the run |
 | `--out=<dir>` | workspace root (summary only) | or `KEEPRUN_OUT`. Collects all run documents in `<dir>/run-<timestamp>/`: `goal.md`, `handoff-<N>.md`, `summary.md`. `KEEPRUN_SUMMARY=off` disables the default summary |
 | `--watchdog=<duration>` | 2h | or `KEEPRUN_WATCHDOG`. Inactivity timeout, not a per-round limit: any session activity (message/part updates, status) resets it, so long build rounds are never killed. It only stops when the session is silent for the whole window |
 
-Time budget details: the remaining time is included in every plan/build prompt; when the budget is exhausted the loop stops with `time budget exhausted`; if the challenger returns `KEEPRUN_DONE` five consecutive times with no intervening build work, it stops with `challenger found no further work` to avoid burning tokens. `KEEPRUN_BLOCKED` always stops immediately (missing credentials or a genuine human decision cannot be resolved autonomously).
+Time budget details: the remaining time is included in every plan/build prompt; when the budget is exhausted the loop stops with `time budget exhausted`; if the challenger returns `KEEPRUN_DONE` five consecutive times with no intervening build work, it stops with `challenger found no further work` to avoid burning tokens. Without `--aggressive`, `KEEPRUN_BLOCKED` stops immediately (missing credentials or a genuine human decision cannot be resolved autonomously); with `--aggressive` the blocker is handed back to the planner with an explicit "assume reasonable defaults and work around it" directive.
+
+Aggressive details: it is meant for "run until the clock runs out" sessions. Start it with a time budget (e.g. `--for=8h`); without one it runs until `/keepstop`. Retries back off exponentially up to 60s, and a context handoff cap is reset instead of stopping.
 
 Stop visibility: every stop reason is written into the transcript as a synthetic note (`KEEPRUN stopped (<reason>)`), plus a 6-second toast and, when documents are enabled, a summary file — nothing disappears silently.
 

@@ -27,8 +27,9 @@ opencode 原生在每一轮 assistant 回复结束后进入 `idle`，等待用�
 |---|---|
 | 核心行为 | 自动续跑（每轮结束后自动注入下一步） |
 | 触发方式 | `/keeprun` + `/keepstop`（会话级，不做关键字/全局常开） |
-| 停止条件 | 完成标记 + 最大轮数（默认 20）；可选时间预算 `--for=8h` |
-| 时间预算 | `--for=<时长>`（`30s`/`45m`/`8h`/`1d`/`1h30m`）；设预算即默认解除轮数上限 |
+| 停止条件 | 完成标记；轮数**默认无限**（`--max=N`/`KEEPRUN_MAX_CYCLES` 可显式设限）；可选时间预算 `--for=8h` |
+| 激进模式 | `--aggressive`（`KEEPRUN_AGGRESSIVE=1`）：只有时间预算耗尽或 `/keepstop` 才停；BLOCKED、错误、看门狗、交接上限一律自行恢复继续（指数退避重试） |
+| 时间预算 | `--for=<时长>`（`30s`/`45m`/`8h`/`1d`/`1h30m`） |
 | 完成后续跑 | 预算未耗尽时 `KEEPRUN_DONE` 触发**追问者（challenger）轮**，由强模型审查并挖掘新任务 |
 | 最终目标 | `--goal="文本"` 或 `--goal=@goal.md`（文档，相对 worktree，16KB 截断）；启动时快照，运行中不允许修改（改动仅告警，不改变目标） |
 | 上下文溢出 | 识别 `ContextOverflowError`/溢出文本 → 自动 compact → 强模型写交接文档 → **新建 session** 继续同一 keeprun（`MAX_HANDOFFS=5`） |
@@ -173,7 +174,7 @@ type St = {
   goalMtimeMs?: number      // 启动时快照的 mtime；变化只告警不改目标
   goalWarned: boolean
   cycles: number
-  maxCycles: number         // 设了时间预算且未显式 --max 时为 Infinity
+  maxCycles: number         // 默认 Infinity；--max/环境变量可显式设限
   budgetMs?: number         // 时间预算总长
   deadline?: number         // epoch ms；Date.now() >= deadline 即到期
   emptyRounds: number       // 追问者连续空手轮数
@@ -181,6 +182,10 @@ type St = {
   overflowed: boolean       // 收到 ContextOverflowError，待本轮结束后交接
   handoffs: number          // 已执行交接次数
   startedAt: number         // /keeprun 启动时间（用于总结时长）
+  watchdogMs: number        // 静默超时窗口（默认 2h，活动事件会重置）
+  aggressive: boolean       // 激进模式：除预算/手动停止外一律继续
+  retries: number           // 激进模式连续自救次数（用于退避）
+  retryTimer?: Timeout      // 待执行的继续计时器
   outDir?: string           // --out 解析出的本次运行文档目录
   summaryOn: boolean        // 是否生成总结（--out 隐含开启；KEEPRUN_SUMMARY=off 关闭默认路径）
   summarizing: boolean      // stop() 已转入总结阶段，防重入
@@ -339,7 +344,8 @@ type St = {
 - `session.deleted`：清理状态与看门狗。
 - 看门狗：**静默超时**而非轮次超时。`dispatch` 设默认 2 小时（`--watchdog`/`KEEPRUN_WATCHDOG` 可调）；任何会话活动事件（`message.updated`/`message.part.delta`/`message.part.updated`/`session.status`）都会重置计时器，因此长时间正常工作的 build 轮不会被误杀；只有整段窗口内完全无活动（真挂死）才停止，原因记为 `watchdog: no activity for <时长>`。
 - 停止原因必显：所有停止路径都会在会话中留下 synthetic 提示 `KEEPRUN stopped (<原因>)`（即使无需恢复 agent/model），并 toast；启用文档时同时写 summary。
-- 最大轮数：每次 build 完成 `cycles++`；`cycles >= maxCycles` 停止。未显式 `--max` 而设了 `--for` 时 `maxCycles = Infinity`。
+- 最大轮数：默认 `maxCycles = Infinity`；仅当显式 `--max=N` 或 `KEEPRUN_MAX_CYCLES` 时按上限停止。激进模式下即使显式上限也忽略。
+- 激进模式（`stop()` 的统一闸门）：`aggressiveAllowsStop(reason)` 只放行 `time budget exhausted`、`stopped by user`、`session deleted`；其余停止原因（BLOCKED、assistant/session 错误、provider auth、aborted、看门狗、交接上限、交接失败、触顶、追问者空转）都转入 `keepGoing()`：toast 告警 + 指数退避（`KEEPRUN_RETRY_MS` 基数，默认 2s，上限 60s）+ 重新派发 plan 轮，并附“假设合理默认值、绕过失败/阻塞路径、不要输出 BLOCKED”的指令。交接上限触顶时重置 `handoffs` 再继续；无 `--for` 时一直跑到 `/keepstop`。
 - 时间预算：每次 idle 先检查 `Date.now() >= deadline`，到期停止（`time budget exhausted`）。
 - 完成但预算未耗尽：`KEEPRUN_DONE` 不停止，转入追问者轮；追问者连续 5 轮（`CHALLENGER_EMPTY_LIMIT`）仍无产出才停止（`challenger found no further work`），防止空转烧 token。
 - 上下文溢出：`ContextOverflowError` 事件只标记不停止（opencode 自动 compact 并继续）；ai 消息上的溢出错误触发一次 compact 后交接；交接最多 5 次（`MAX_HANDOFFS`），超出停止（`too many context handoffs`）。
@@ -454,8 +460,10 @@ KEEPRUN is being stopped. Confirm in one short sentence and do not start new wor
 |---|---|---|
 | 规划模型 | `deepseek/GLM-5.3` | 改 `agents/keeprun-plan.md` 的 `model`；或 `/keeprun --plan-model=provider/model`；或环境变量 `KEEPRUN_PLAN_MODEL` |
 | 实施模型 | `/keeprun` 前的原模型 | `/keeprun --build-model=provider/model` 覆盖 |
-| 最大循环 | 20 | `/keeprun --max=N`；或环境变量 `KEEPRUN_MAX_CYCLES` |
-| 时间预算 | 无 | `/keeprun --for=8h`；或环境变量 `KEEPRUN_FOR`；设预算后默认解除轮数上限 |
+| 最大循环 | 无限 | 仅在需要上限时 `/keeprun --max=N`；或环境变量 `KEEPRUN_MAX_CYCLES` |
+| 激进模式 | 关 | `/keeprun --aggressive`；或环境变量 `KEEPRUN_AGGRESSIVE=1` |
+| 激进重试基数 | 2s（上限 60s） | 环境变量 `KEEPRUN_RETRY_MS` |
+| 时间预算 | 无 | `/keeprun --for=8h`；或环境变量 `KEEPRUN_FOR` |
 | 最终目标 | 任务文本 | `--goal="文本"` / `--goal=@goal.md`；或环境变量 `KEEPRUN_GOAL`；启动快照，运行中不改 |
 | 目标文档截断 | 16KB | 常量 `GOAL_DOC_CHAR_LIMIT` |
 | 追问者空转上限 | 5 | 代码常量 `CHALLENGER_EMPTY_LIMIT` |
@@ -485,6 +493,8 @@ KEEPRUN is being stopped. Confirm in one short sentence and do not start new wor
 9. **交接后的新会话**：keeprun 通过 API 驱动新会话，但 TUI 需手动切换过去查看；旧会话会留一条含新会话 id 的迁移提示。
 10. **目标文档不可变**：`--goal=@file` 在启动时快照；运行中修改文件只告警、不改变目标。需要换目标时先 `/keepstop` 再重新 `/keeprun`。
 11. **文档与仓库污染**：`--out` 目录（含 `run-*` 子目录）由使用者选择；缺省总结写在**工作区根** `summary-<时间戳>.md`，如不希望入库请加入 `.gitignore` 或改用 `--out` 指向忽略目录。
+12. **激进模式没有内置兜底**：不给 `--for` 时会一直运行到 `/keepstop`；持续错误会按退避重试（2s→60s），可能持续消耗 token，适合“跑到时间到”的场景。
+13. **轮数默认无限**：没有 `--max` 时，唯一的自动停止来源是完成标记、时间预算或显式停止条件；长任务请配合 `--for` 使用。
 
 ---
 
@@ -532,8 +542,12 @@ opencode debug config
 - `--out`：启动时建 `run-<时间戳>/` 并写 `goal.md`；完成停止写 `summary.md`（元数据头 + 正文）；交接写 `handoff-<N>.md`；
 - 无 `--out`：停止时写工作区根 `summary-<时间戳>.md`；`KEEPRUN_SUMMARY=off` 时不再派发总结轮、不写文件；
 - 总结轮失败/错误 → 机械兜底仍是文件；`/keepstop` → 本轮结束后停止并总结。
+- 看门狗：活动事件保持存活（>超时窗口不停止）；完全静默才触发且写总结；
+- 停止原因必显：无需恢复时也写 `KEEPRUN stopped (<原因>)`；
+- 默认轮数无限（25 轮不停止）；`KEEPRUN_MAX_CYCLES` 仍可显式设限；
+- 激进模式：BLOCKED / assistant 错误 / 看门狗静默 → 不停止并按退避重新派发 plan；忽略 `--max`；时间预算到期与 `/keepstop` 仍停止；`KEEPRUN_AGGRESSIVE` 环境变量生效。
 
-全部通过。仓库内测试：`node test/state-machine.test.mjs`。
+全部通过（39 项）。仓库内测试：`node test/state-machine.test.mjs`。
 
 ---
 
@@ -546,12 +560,13 @@ opencode debug config
    /keeprun 修复 AArch64 LSO 的 ldp 配对回归
    /keeprun 完成任务 --plan-model=gptplus/claude-opus-4-6-thinking-aws --max=10
    /keeprun 推进 S1 --for=8h --goal=@doc/final_goal-v1.md --out=doc/keeprun
+   /keeprun 推进 S1 --for=8h --aggressive --goal=@doc/final_goal-v1.md --out=doc/keeprun
    ```
 
 3. 观察会话自动切换：
    - `keeprun-plan`（规划模型）→ 下一步计划；
    - `build`（原模型）→ 实施 + 验证；
-   - 重复直到 `KEEPRUN_DONE` / `KEEPRUN_BLOCKED` / 触顶。
+   - 重复直到 `KEEPRUN_DONE` / 时间预算耗尽 / `/keepstop`（启用 `--aggressive` 时 BLOCKED/错误/看门狗都不会结束）。
 4. 随时 `/keepstop` 停止并恢复。
 
 ---
