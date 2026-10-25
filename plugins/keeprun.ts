@@ -16,6 +16,7 @@ type St = {
   goalMtimeMs?: number
   goalWarned: boolean
   startedAt: number
+  watchdogMs: number
   outDir?: string
   summaryOn: boolean
   summarizing: boolean
@@ -43,7 +44,8 @@ const DEFAULT_MAX_CYCLES = 20
 const CHALLENGER_EMPTY_LIMIT = 5
 const MAX_HANDOFFS = 5
 const GOAL_DOC_CHAR_LIMIT = 16 * 1024
-const WATCHDOG_MS = 30 * 60 * 1000
+const DEFAULT_WATCHDOG_MS = 2 * 60 * 60 * 1000
+const ACTIVITY_EVENTS = ["message.updated", "message.part.delta", "message.part.updated", "session.status"]
 
 const CONTEXT_ERROR_RE = /context limit|exceeds the context|context length|too many tokens|maximum context/i
 const HANDOFF_MARK = "KEEPRUN_HANDOFF"
@@ -100,6 +102,8 @@ function parseArgs(raw: string) {
   let max: number | undefined
   let forMs: number | undefined
   let forInvalid = false
+  let watchdogMs: number | undefined
+  let watchdogInvalid = false
   let goal: string | undefined
   let out: string | undefined
   let task = raw || ""
@@ -120,6 +124,11 @@ function parseArgs(raw: string) {
     if (!forMs) forInvalid = true
     return ""
   })
+  task = task.replace(/--watchdog=(\S*)/g, (_, v) => {
+    watchdogMs = parseDuration(v)
+    if (!watchdogMs) watchdogInvalid = true
+    return ""
+  })
   task = task.replace(/--goal=(?:"([^"]*)"|'([^']*)'|(\S+))/g, (_, q1, q2, q3) => {
     goal = q1 !== undefined ? q1 : q2 !== undefined ? q2 : q3
     return ""
@@ -129,7 +138,7 @@ function parseArgs(raw: string) {
     return ""
   })
   task = task.replace(/\s+/g, " ").trim()
-  return { task, planModel, buildModel, max, forMs, forInvalid, goal, out }
+  return { task, planModel, buildModel, max, forMs, forInvalid, watchdogMs, watchdogInvalid, goal, out }
 }
 
 function unwrap(res: any): any {
@@ -184,6 +193,7 @@ export default async function Keeprun(input: any) {
   const envMax = Number(process.env.KEEPRUN_MAX_CYCLES)
   const defaultMax = Number.isFinite(envMax) && envMax > 0 ? envMax : DEFAULT_MAX_CYCLES
   const defaultBudget = parseDuration(process.env.KEEPRUN_FOR)
+  const defaultWatchdog = parseDuration(process.env.KEEPRUN_WATCHDOG) || DEFAULT_WATCHDOG_MS
   const envGoal = process.env.KEEPRUN_GOAL
   const envOut = process.env.KEEPRUN_OUT
   const summaryDisabled = ["0", "off", "false", "no"].includes(
@@ -249,8 +259,18 @@ export default async function Keeprun(input: any) {
     }
   }
 
-  async function restoreSession(sessionID: string, st: St, note: string) {
-    await setPermissions(sessionID, UNHARDEN)
+  function armWatchdog(sessionID: string, st: St) {
+    clearWatchdog(st)
+    if (!st.active) return
+    st.watchdog = setTimeout(() => {
+      const current = states.get(sessionID)
+      if (current && current === st && current.active) {
+        stop(sessionID, current, "watchdog: no activity for " + fmtDuration(st.watchdogMs)).catch(() => {})
+      }
+    }, st.watchdogMs)
+  }
+
+  async function noteSession(sessionID: string, st: St, note: string) {
     try {
       await client.session.promptAsync({
         path: { id: sessionID },
@@ -262,6 +282,11 @@ export default async function Keeprun(input: any) {
         },
       })
     } catch {}
+  }
+
+  async function restoreSession(sessionID: string, st: St, note: string) {
+    await setPermissions(sessionID, UNHARDEN)
+    await noteSession(sessionID, st, note)
   }
 
   async function needsRestore(sessionID: string, st: St): Promise<boolean> {
@@ -387,21 +412,17 @@ export default async function Keeprun(input: any) {
     if (st.summaryPath) await toast("summary written: " + st.summaryPath, "success")
     await toast("stopped: " + finalReason, done ? "success" : "warning")
     const summaryNote = st.summaryPath ? " Docs: " + st.summaryPath + "." : ""
+    const note = "KEEPRUN stopped (" + finalReason + ")." + summaryNote
     if (await needsRestore(sessionID, st)) {
-      await restoreSession(sessionID, st, "KEEPRUN stopped (" + finalReason + ")." + summaryNote + " Session restored to build.")
+      await restoreSession(sessionID, st, note + " Session restored to build.")
     } else {
       await setPermissions(sessionID, UNHARDEN)
+      await noteSession(sessionID, st, note)
     }
   }
 
   async function dispatch(sessionID: string, st: St, body: any) {
-    clearWatchdog(st)
-    st.watchdog = setTimeout(() => {
-      const current = states.get(sessionID)
-      if (current && current === st && current.active) {
-        stop(sessionID, current, "watchdog timeout").catch(() => {})
-      }
-    }, WATCHDOG_MS)
+    armWatchdog(sessionID, st)
     try {
       const res = await client.session.promptAsync({ path: { id: sessionID }, body })
       if (failed(res)) throw res.error
@@ -872,7 +893,11 @@ export default async function Keeprun(input: any) {
       if (parsed.forInvalid) {
         await toast("invalid --for value; time budget ignored (use e.g. --for=8h)", "warning")
       }
+      if (parsed.watchdogInvalid) {
+        await toast("invalid --watchdog value; using " + fmtDuration(defaultWatchdog) + " (use e.g. --watchdog=2h)", "warning")
+      }
       const budgetMs = parsed.forMs ?? defaultBudget
+      const watchdogMs = parsed.watchdogMs ?? defaultWatchdog
       const explicitMax = parsed.max && parsed.max > 0 ? parsed.max : undefined
       const maxCycles = explicitMax ?? (budgetMs ? Infinity : defaultMax)
       const taskText = parsed.task || "(continue the current conversation task)"
@@ -902,6 +927,7 @@ export default async function Keeprun(input: any) {
         goalMtimeMs: goal.mtimeMs,
         goalWarned: false,
         startedAt: Date.now(),
+        watchdogMs,
         outDir,
         summaryOn: outDir ? true : !summaryDisabled,
         summarizing: false,
@@ -977,6 +1003,12 @@ export default async function Keeprun(input: any) {
       try {
         if (!event?.type) return
         const props = event.properties || {}
+        if (ACTIVITY_EVENTS.includes(event.type)) {
+          const sid = props.sessionID || props.part?.sessionID || props.info?.sessionID
+          const st = sid ? states.get(sid) : undefined
+          if (st && st.active) armWatchdog(sid, st)
+          return
+        }
         if (event.type === "session.idle") {
           await onIdle(props.sessionID)
           return

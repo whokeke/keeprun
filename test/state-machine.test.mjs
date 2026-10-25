@@ -256,7 +256,8 @@ await check("time budget expiry stops the loop", async () => {
   assistant(h, "KEEPRUN_START")
   await idle(h)
   assert.match(String(lastToast(h).message), /stopped: time budget exhausted \(1s\)/)
-  assert.equal(h.prompts.length, 0)
+  assert.equal(h.prompts.filter((p) => !p.body.noReply).length, 0)
+  assert.match(promptText(lastPromptBody(h)), /KEEPRUN stopped \(time budget exhausted/)
 })
 
 await check("consecutive empty challenger rounds hit the backstop", async () => {
@@ -563,6 +564,62 @@ await check("BLOCKED stop reason is recorded in the summary metadata", async () 
   assert.match(summary, /stop_reason: needs human decision \(planner\)/)
   assert.match(summary, /BLOCKED SUMMARY/)
   await rm(outBase, { recursive: true, force: true })
+})
+
+await check("watchdog is an inactivity timeout: activity keeps the loop alive", async () => {
+  const h = harness()
+  await start(h, "do X --watchdog=1s")
+  assistant(h, "KEEPRUN_START")
+  await idle(h)
+  for (let i = 0; i < 5; i++) {
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    await emit(h, "message.part.updated", { sessionID: "s1", part: { sessionID: "s1", type: "text" } })
+  }
+  assert.equal(stopped(h), false)
+  assert.ok(!h.toasts.some((t) => /watchdog/.test(String(t.message))))
+  assistant(h, "KEEPRUN_PLAN_READY")
+  await idle(h)
+  assert.equal(lastPromptBody(h).agent, "build")
+})
+
+await check("watchdog fires only when nothing happens", async () => {
+  const outBase = await mkdtemp(join(tmpdir(), "keeprun-out-"))
+  const h = harness()
+  await start(h, "do X --watchdog=1s --out=" + outBase)
+  assistant(h, "KEEPRUN_START")
+  await idle(h)
+  await new Promise((resolve) => setTimeout(resolve, 1300))
+  assert.match(promptText(lastPromptBody(h)), /KEEPRUN summary phase/)
+  assert.match(promptText(lastPromptBody(h)), /watchdog: no activity for 1s/)
+  assistant(h, "WD SUMMARY\nKEEPRUN_SUMMARY")
+  await idle(h)
+  const summary = await readFile(join(await runDirOf(outBase), "summary.md"), "utf8")
+  assert.match(summary, /stop_reason: watchdog: no activity for 1s/)
+  assert.match(summary, /WD SUMMARY/)
+  assert.equal(stopped(h), true)
+  await rm(outBase, { recursive: true, force: true })
+})
+
+await check("stop reason is always recorded in the transcript", async () => {
+  const h = harness()
+  await start(h, "do X")
+  assistant(h, "KEEPRUN_START")
+  await idle(h)
+  assistant(h, "KEEPRUN_PLAN_READY")
+  await idle(h)
+  assistant(h, "KEEPRUN_DONE")
+  await idle(h)
+  const users = h.messagesFor("s1").filter((m) => m.info.role === "user")
+  const note = users[users.length - 1]
+  assert.equal(note.info.agent, "build")
+  assert.equal(promptText({ parts: note.parts }), "KEEPRUN stopped (task complete).")
+})
+
+await check("invalid --watchdog warns and is stripped from the task", async () => {
+  const h = harness()
+  await start(h, "do X --watchdog=8")
+  assert.ok(h.toasts.some((t) => /invalid --watchdog/.test(String(t.message))))
+  assert.doesNotMatch(promptText({ parts: h.output.parts }), /--watchdog/)
 })
 
 await rm(goalDir, { recursive: true, force: true })

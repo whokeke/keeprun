@@ -337,7 +337,8 @@ type St = {
 
 - `session.error` 事件：若该会话处于 active，立即停止（涵盖注入失败、模型不存在等）。
 - `session.deleted`：清理状态与看门狗。
-- 看门狗：每次 `dispatch` 设 30 分钟定时器；若期间无 idle/error，则停止并提示。
+- 看门狗：**静默超时**而非轮次超时。`dispatch` 设默认 2 小时（`--watchdog`/`KEEPRUN_WATCHDOG` 可调）；任何会话活动事件（`message.updated`/`message.part.delta`/`message.part.updated`/`session.status`）都会重置计时器，因此长时间正常工作的 build 轮不会被误杀；只有整段窗口内完全无活动（真挂死）才停止，原因记为 `watchdog: no activity for <时长>`。
+- 停止原因必显：所有停止路径都会在会话中留下 synthetic 提示 `KEEPRUN stopped (<原因>)`（即使无需恢复 agent/model），并 toast；启用文档时同时写 summary。
 - 最大轮数：每次 build 完成 `cycles++`；`cycles >= maxCycles` 停止。未显式 `--max` 而设了 `--for` 时 `maxCycles = Infinity`。
 - 时间预算：每次 idle 先检查 `Date.now() >= deadline`，到期停止（`time budget exhausted`）。
 - 完成但预算未耗尽：`KEEPRUN_DONE` 不停止，转入追问者轮；追问者连续 5 轮（`CHALLENGER_EMPTY_LIMIT`）仍无产出才停止（`challenger found no further work`），防止空转烧 token。
@@ -461,7 +462,7 @@ KEEPRUN is being stopped. Confirm in one short sentence and do not start new wor
 | 交接次数上限 | 5 | 代码常量 `MAX_HANDOFFS` |
 | 运行文档目录 | 无（仅工作区根 summary） | `--out=<dir>`；或环境变量 `KEEPRUN_OUT`；自动建 `run-<时间戳>/` 子目录 |
 | 结束总结 | 开 | `KEEPRUN_SUMMARY=off` 关闭默认总结；显式 `--out` 视为开启 |
-| 看门狗 | 30 分钟 | 代码常量 `WATCHDOG_MS` |
+| 看门狗（静默超时） | 2 小时 | `--watchdog=<时长>`；或环境变量 `KEEPRUN_WATCHDOG`；会话活动自动重置 |
 
 优先级：命令行参数 > 环境变量 > agent frontmatter。
 

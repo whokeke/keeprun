@@ -50,8 +50,11 @@ curl -fsSL https://raw.githubusercontent.com/whokeke/keeprun/main/uninstall.sh |
 | `--for=<duration>` | none | `30s` / `45m` / `8h` / `1d` / `1h30m`; or `KEEPRUN_FOR`. Lifts the cycle cap; `KEEPRUN_DONE` triggers a challenger round while time remains |
 | `--goal="text"` / `--goal=@file.md` | the task text | or `KEEPRUN_GOAL`. `@` reads a goal document (relative to the worktree, capped at 16 KB); it is snapshotted at start and must not change during the run |
 | `--out=<dir>` | workspace root (summary only) | or `KEEPRUN_OUT`. Collects all run documents in `<dir>/run-<timestamp>/`: `goal.md`, `handoff-<N>.md`, `summary.md`. `KEEPRUN_SUMMARY=off` disables the default summary |
+| `--watchdog=<duration>` | 2h | or `KEEPRUN_WATCHDOG`. Inactivity timeout, not a per-round limit: any session activity (message/part updates, status) resets it, so long build rounds are never killed. It only stops when the session is silent for the whole window |
 
 Time budget details: the remaining time is included in every plan/build prompt; when the budget is exhausted the loop stops with `time budget exhausted`; if the challenger returns `KEEPRUN_DONE` five consecutive times with no intervening build work, it stops with `challenger found no further work` to avoid burning tokens. `KEEPRUN_BLOCKED` always stops immediately (missing credentials or a genuine human decision cannot be resolved autonomously).
+
+Stop visibility: every stop reason is written into the transcript as a synthetic note (`KEEPRUN stopped (<reason>)`), plus a 6-second toast and, when documents are enabled, a summary file — nothing disappears silently.
 
 Context handoff details: opencode's automatic compaction is honoured (a `ContextOverflowError` no longer stops the loop). For context errors the provider does not classify, keeprun compacts the session itself before writing the handoff. If the model-written handoff fails, the plugin builds a fallback document from the recent transcript. At most 5 handoffs are allowed per run (`too many context handoffs`). The new session is driven automatically; open it in the TUI to follow along (the old session shows a note with the new session id).
 
