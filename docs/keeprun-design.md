@@ -27,7 +27,9 @@ opencode 原生在每一轮 assistant 回复结束后进入 `idle`，等待用�
 |---|---|
 | 核心行为 | 自动续跑（每轮结束后自动注入下一步） |
 | 触发方式 | `/keeprun` + `/keepstop`（会话级，不做关键字/全局常开） |
-| 停止条件 | 完成标记 + 最大轮数（默认 20） |
+| 停止条件 | 完成标记 + 最大轮数（默认 20）；可选时间预算 `--for=8h` |
+| 时间预算 | `--for=<时长>`（`30s`/`45m`/`8h`/`1d`/`1h30m`）；设预算即默认解除轮数上限 |
+| 完成后续跑 | 预算未耗尽时 `KEEPRUN_DONE` 触发**追问者（challenger）轮**，由强模型审查并挖掘新任务 |
 | 规划模型 | 默认 `deepseek/GLM-5.3`，可通过参数/环境变量/agent 文件修改 |
 | 实施阶段 | 内置 `build` agent + `/keeprun` 前的**原模型** |
 | 零打断加固 | `doom_loop: allow` + `question: deny`（keeprun 会话级） |
@@ -163,7 +165,11 @@ type St = {
   buildModel?: ModelRef     // /keeprun 前的原模型
   task: string
   cycles: number
-  maxCycles: number
+  maxCycles: number         // 设了时间预算且未显式 --max 时为 Infinity
+  budgetMs?: number         // 时间预算总长
+  deadline?: number         // epoch ms；Date.now() >= deadline 即到期
+  emptyRounds: number       // 追问者连续空手轮数
+  challenging: boolean      // 当前是否处于追问者轮
   lastAssistantID?: string  // 去重
   capturePending: boolean    // 等待捕获原模型
   restore: boolean           // /keepstop 后待恢复
@@ -175,10 +181,11 @@ type St = {
 ### 5.2 完整时序
 
 ```
-用户：/keeprun <task> [--plan-model=...] [--build-model=...] [--max=N]
+用户：/keeprun <task> [--plan-model=...] [--build-model=...] [--max=N] [--for=8h]
   │
   ├─ command.execute.before
-  │    ├─ 解析参数、剥离 flag
+  │    ├─ 解析参数、剥离 flag（含时长解析，非法值告警忽略）
+  │    ├─ 有 --for 且无显式 --max → maxCycles = ∞；deadline = now + 时长
   │    ├─ 会话级加固：session.permission += {doom_loop:allow, question:deny}
   │    ├─ 状态 phase = "ack"
   │    └─ 覆盖命令 parts 为“确认 + 任务”
@@ -193,18 +200,30 @@ type St = {
   │    └─ 结尾标记：KEEPRUN_PLAN_READY / KEEPRUN_DONE / KEEPRUN_BLOCKED
   │
   ├─ idle(plan)
-  │    ├─ DONE     → 停止
-  │    ├─ BLOCKED  → 停止并提示
-  │    └─ 其他     → 注入 build 轮：agent=build, model=原模型
+  │    ├─ 时间到       → 停止（time budget exhausted）
+  │    ├─ BLOCKED      → 停止并提示
+  │    ├─ DONE
+  │    │    ├─ 无预算         → 停止（task complete）
+  │    │    └─ 预算未耗尽     → 追问者轮（连续 5 次空手则停止）
+  │    └─ 其他         → 注入 build 轮：agent=build, model=原模型
+  │
+  ├─ 追问者（challenger）轮：仍用 keeprun-plan agent，提示词改为“严格审查 + 挖新任务”
+  │    ├─ 产出 PLAN_READY → 正常进入 build（emptyRounds 清零）
+  │    └─ 再次 DONE       → emptyRounds++ 并升级追问；≥ 5 → 停止（challenger found no further work）
   │
   ├─ build 轮（实施 + 验证）
   │    └─ 结尾标记：KEEPRUN_DONE / KEEPRUN_CONTINUE
   │
   └─ idle(build)
-       ├─ DONE          → 停止
-       ├─ cycles++ ≥ max → 停止（触顶）
+       ├─ 时间到       → 停止
+       ├─ DONE
+       │    ├─ 无预算         → 停止
+       │    └─ 预算未耗尽     → 追问者轮
+       ├─ cycles++ ≥ max → 停止（触顶；有预算且无显式 --max 时 max=∞）
        └─ 否则          → 回到 plan 轮
 ```
+
+每轮 idle 都会先检查 `Date.now() >= deadline`；plan/build 提示词中附带剩余时间，让模型感知预算节奏。
 
 ### 5.3 为什么有 ack 轮
 
@@ -231,8 +250,11 @@ type St = {
 
 | 函数 | 说明 |
 |---|---|
-| `parseArgs` | 解析 `--plan-model=`、`--build-model=`、`--max=`，并从任务文本中剥离 |
+| `parseArgs` | 解析 `--plan-model=`、`--build-model=`、`--max=`、`--for=`，并从任务文本中剥离 |
 | `parseModel` | `provider/model` → `{providerID, modelID}` |
+| `parseDuration` / `fmtDuration` | 时长字符串 ↔ 毫秒（`8h`/`1h30m`/`45m`），用于预算与剩余时间展示 |
+| `sendChallenge` | 追问者轮：仍走 `keeprun-plan` agent，提示词切换为对抗式审查并要求挖出新任务 |
+| `timeLeft` | 剩余预算格式化，供提示词与 toast 使用 |
 | `setPermissions` | 调 `client.session.update({body:{permission:[...]}})`；SDK 类型偏旧，使用 `as any` |
 | `loadMessages` / `lastAssistant` / `lastUserModel` | 读取最近消息、最后 assistant、最后 user 的模型 |
 | `sendPlan` | 设置 `phase=plan`，注入规划消息 |
@@ -276,7 +298,9 @@ type St = {
 - `session.error` 事件：若该会话处于 active，立即停止（涵盖注入失败、模型不存在等）。
 - `session.deleted`：清理状态与看门狗。
 - 看门狗：每次 `dispatch` 设 30 分钟定时器；若期间无 idle/error，则停止并提示。
-- 最大轮数：每次 build 完成 `cycles++`；`cycles >= maxCycles` 停止。
+- 最大轮数：每次 build 完成 `cycles++`；`cycles >= maxCycles` 停止。未显式 `--max` 而设了 `--for` 时 `maxCycles = Infinity`。
+- 时间预算：每次 idle 先检查 `Date.now() >= deadline`，到期停止（`time budget exhausted`）。
+- 完成但预算未耗尽：`KEEPRUN_DONE` 不停止，转入追问者轮；追问者连续 5 轮（`CHALLENGER_EMPTY_LIMIT`）仍无产出才停止（`challenger found no further work`），防止空转烧 token。
 - 手动 `/keepstop`：置 `active=false, restore=true`，在随后的 idle 恢复。
 
 ### 6.5 会话级“零打断”加固
@@ -387,6 +411,8 @@ KEEPRUN is being stopped. Confirm in one short sentence and do not start new wor
 | 规划模型 | `deepseek/GLM-5.3` | 改 `agents/keeprun-plan.md` 的 `model`；或 `/keeprun --plan-model=provider/model`；或环境变量 `KEEPRUN_PLAN_MODEL` |
 | 实施模型 | `/keeprun` 前的原模型 | `/keeprun --build-model=provider/model` 覆盖 |
 | 最大循环 | 20 | `/keeprun --max=N`；或环境变量 `KEEPRUN_MAX_CYCLES` |
+| 时间预算 | 无 | `/keeprun --for=8h`；或环境变量 `KEEPRUN_FOR`；设预算后默认解除轮数上限 |
+| 追问者空转上限 | 5 | 代码常量 `CHALLENGER_EMPTY_LIMIT` |
 | 看门狗 | 30 分钟 | 代码常量 `WATCHDOG_MS` |
 
 优先级：命令行参数 > 环境变量 > agent frontmatter。
@@ -441,8 +467,14 @@ opencode debug config
 - `/keepstop` 在 idle 后恢复 `build`；
 - 未显式指定规划模型时**不传 model**（交由 agent 决定）；
 - 显式 `--plan-model` 时正确传参。
+- 时长解析：`8h`/`45m`/`30s`/`1d`/`1h30m` 及非法值；
+- `--for` 时忽略轮数上限；`--for` + `--max` 同时生效；
+- `KEEPRUN_DONE` 且预算未耗尽 → 追问者轮；追问者 PLAN_READY → build 并清零空转计数；
+- 预算耗尽 → `time budget exhausted` 停止；
+- 追问者连续 5 次空手 → `challenger found no further work` 停止；
+- 有预算时 `KEEPRUN_BLOCKED` 仍立即停止。
 
-全部通过。
+全部通过。仓库内测试：`node test/state-machine.test.mjs`。
 
 ---
 

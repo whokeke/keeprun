@@ -10,6 +10,10 @@ type St = {
   task: string
   cycles: number
   maxCycles: number
+  budgetMs?: number
+  deadline?: number
+  emptyRounds: number
+  challenging: boolean
   lastAssistantID?: string
   capturePending: boolean
   restore: boolean
@@ -20,6 +24,7 @@ type St = {
 const PLAN_AGENT = "keeprun-plan"
 const BUILD_AGENT = "build"
 const DEFAULT_MAX_CYCLES = 20
+const CHALLENGER_EMPTY_LIMIT = 5
 const WATCHDOG_MS = 30 * 60 * 1000
 
 const MARK_START = "KEEPRUN_START"
@@ -44,10 +49,35 @@ function parseModel(value?: string | null): ModelRef | undefined {
   return { providerID: value.slice(0, i), modelID: value.slice(i + 1) }
 }
 
+export function parseDuration(value?: string | null): number | undefined {
+  if (!value) return undefined
+  const m = /^(?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$/.exec(value.trim())
+  if (!m || (!m[1] && !m[2] && !m[3] && !m[4])) return undefined
+  const [d, h, mi, s] = [m[1], m[2], m[3], m[4]].map((x) => (x ? Number(x) : 0))
+  const ms = (((d * 24 + h) * 60 + mi) * 60 + s) * 1000
+  return ms > 0 ? ms : undefined
+}
+
+export function fmtDuration(ms: number): string {
+  const total = Math.max(0, Math.floor(ms / 1000))
+  const d = Math.floor(total / 86400)
+  const h = Math.floor((total % 86400) / 3600)
+  const m = Math.floor((total % 3600) / 60)
+  const s = total % 60
+  const parts: string[] = []
+  if (d) parts.push(d + "d")
+  if (h) parts.push(h + "h")
+  if (m) parts.push(m + "m")
+  if (s || parts.length === 0) parts.push(s + "s")
+  return parts.join("")
+}
+
 function parseArgs(raw: string) {
   let planModel: ModelRef | undefined
   let buildModel: ModelRef | undefined
   let max: number | undefined
+  let forMs: number | undefined
+  let forInvalid = false
   let task = raw || ""
   task = task.replace(/--plan-model=(\S+)/g, (_, v) => {
     planModel = parseModel(v)
@@ -61,8 +91,13 @@ function parseArgs(raw: string) {
     max = Number(v)
     return ""
   })
+  task = task.replace(/--for=(\S*)/g, (_, v) => {
+    forMs = parseDuration(v)
+    if (!forMs) forInvalid = true
+    return ""
+  })
   task = task.replace(/\s+/g, " ").trim()
-  return { task, planModel, buildModel, max }
+  return { task, planModel, buildModel, max, forMs, forInvalid }
 }
 
 function unwrap(res: any): any {
@@ -109,6 +144,7 @@ export default async function Keeprun(input: any) {
   const defaultPlanModel = parseModel(process.env.KEEPRUN_PLAN_MODEL)
   const envMax = Number(process.env.KEEPRUN_MAX_CYCLES)
   const defaultMax = Number.isFinite(envMax) && envMax > 0 ? envMax : DEFAULT_MAX_CYCLES
+  const defaultBudget = parseDuration(process.env.KEEPRUN_FOR)
 
   async function toast(message: string, variant: "info" | "success" | "warning" | "error" = "info") {
     try {
@@ -230,18 +266,25 @@ export default async function Keeprun(input: any) {
     }
   }
 
+  function timeLeft(st: St): string | undefined {
+    if (!st.deadline) return undefined
+    return fmtDuration(st.deadline - Date.now())
+  }
+
   async function sendPlan(sessionID: string, st: St) {
     st.phase = "plan"
     const progress =
       st.cycles === 0
         ? "No build step has run yet."
         : "Build has run " + st.cycles + " step(s); see the conversation above for the latest results."
+    const left = timeLeft(st)
     const text = [
       "KEEPRUN planning phase.",
       "",
       "Task: " + st.task,
       "",
       "State: " + progress,
+      ...(left ? ["Time budget remaining: " + left + ". Keep making concrete progress until the budget is exhausted."] : []),
       "",
       "Produce the single next concrete step that requires no user decision.",
       "You are read-only: do not modify anything and do not ask questions.",
@@ -256,9 +299,13 @@ export default async function Keeprun(input: any) {
 
   async function sendBuild(sessionID: string, st: St) {
     st.phase = "build"
+    st.challenging = false
+    st.emptyRounds = 0
+    const left = timeLeft(st)
     const text = [
       "KEEPRUN build phase.",
       "",
+      ...(left ? ["Time budget remaining: " + left + ". Keep making concrete progress until the budget is exhausted."] : []),
       "Execute exactly the next step described in the planner's last message above.",
       "Work autonomously: do not ask questions, make reasonable assumptions, and verify the result (build/tests) before finishing.",
       "If the ENTIRE task is complete and verified, end with KEEPRUN_DONE on its own final line.",
@@ -267,6 +314,38 @@ export default async function Keeprun(input: any) {
     await dispatch(sessionID, st, {
       agent: BUILD_AGENT,
       ...(st.buildModel ? { model: st.buildModel } : {}),
+      parts: [{ type: "text", text }],
+    })
+  }
+
+  async function sendChallenge(sessionID: string, st: St) {
+    st.phase = "plan"
+    const left = timeLeft(st) || "unknown"
+    const text = [
+      "KEEPRUN challenger phase.",
+      "",
+      "Task: " + st.task,
+      "",
+      "The previous objective was reported complete (KEEPRUN_DONE), but the time budget still has " + left + " remaining. Do not stop.",
+      "Act as a strict adversarial reviewer of everything done so far in this conversation.",
+      "Interrogate the result: what is untested, fragile, incomplete, slow, insecure, or unclear? What would a demanding reviewer reject? What follow-up work is genuinely valuable?",
+      ...(st.emptyRounds > 0
+        ? [
+            "A previous challenger round also found nothing. Probe harder: this is empty round " +
+              (st.emptyRounds + 1) +
+              " of " +
+              CHALLENGER_EMPTY_LIMIT +
+              ".",
+          ]
+        : []),
+      "Challenge dimensions: correctness edge cases, test coverage, error handling, performance, code quality/maintainability, documentation, and adjacent improvements.",
+      "You must propose the single most valuable next task. Output KEEPRUN_DONE only if you can concretely justify that no valuable work remains; that is a last resort.",
+      "You are read-only: do not modify anything and do not ask questions.",
+      "End with KEEPRUN_PLAN_READY, or KEEPRUN_DONE if (and only if) nothing of value remains, or KEEPRUN_BLOCKED: <question>.",
+    ].join("\n")
+    await dispatch(sessionID, st, {
+      agent: PLAN_AGENT,
+      ...(st.planModel ? { model: st.planModel } : {}),
       parts: [{ type: "text", text }],
     })
   }
@@ -294,6 +373,10 @@ export default async function Keeprun(input: any) {
       st.lastAssistantID = id
       clearWatchdog(st)
 
+      if (st.deadline && Date.now() >= st.deadline) {
+        return await stop(sessionID, st, "time budget exhausted (" + fmtDuration(st.budgetMs || 0) + ")")
+      }
+
       if (!st.buildModel) st.buildModel = await lastUserModel(sessionID)
 
       const error = last.info?.error
@@ -319,14 +402,35 @@ export default async function Keeprun(input: any) {
         return
       }
       if (st.phase === "plan") {
-        if (mark === MARK_DONE) return await stop(sessionID, st, "task complete (planner)")
         if (mark === MARK_BLOCKED) return await stop(sessionID, st, "needs human decision (planner)")
+        if (mark === MARK_DONE) {
+          if (!st.deadline) return await stop(sessionID, st, "task complete (planner)")
+          if (st.challenging) {
+            st.emptyRounds += 1
+            if (st.emptyRounds >= CHALLENGER_EMPTY_LIMIT) {
+              return await stop(
+                sessionID,
+                st,
+                "challenger found no further work (" + (timeLeft(st) || "?") + " left)",
+              )
+            }
+          }
+          st.challenging = true
+          await toast("objective complete; challenger round (" + (timeLeft(st) || "?") + " left)", "info")
+          return await sendChallenge(sessionID, st)
+        }
         await sendBuild(sessionID, st)
         return
       }
       if (st.phase === "build") {
-        if (mark === MARK_DONE) return await stop(sessionID, st, "task complete")
         st.cycles += 1
+        if (mark === MARK_DONE) {
+          if (!st.deadline) return await stop(sessionID, st, "task complete")
+          st.challenging = true
+          st.emptyRounds = 0
+          await toast("objective complete; challenger round (" + (timeLeft(st) || "?") + " left)", "info")
+          return await sendChallenge(sessionID, st)
+        }
         if (st.cycles >= st.maxCycles) {
           return await stop(sessionID, st, "max cycles reached (" + st.maxCycles + ")")
         }
@@ -359,6 +463,12 @@ export default async function Keeprun(input: any) {
       if (name !== "keeprun") return
 
       const parsed = parseArgs(String(hook?.arguments || ""))
+      if (parsed.forInvalid) {
+        await toast("invalid --for value; time budget ignored (use e.g. --for=8h)", "warning")
+      }
+      const budgetMs = parsed.forMs ?? defaultBudget
+      const explicitMax = parsed.max && parsed.max > 0 ? parsed.max : undefined
+      const maxCycles = explicitMax ?? (budgetMs ? Infinity : defaultMax)
       const previous = states.get(sessionID)
       if (previous) clearWatchdog(previous)
       const st: St = {
@@ -368,7 +478,11 @@ export default async function Keeprun(input: any) {
         buildModel: parsed.buildModel,
         task: parsed.task || "(continue the current conversation task)",
         cycles: 0,
-        maxCycles: parsed.max && parsed.max > 0 ? parsed.max : defaultMax,
+        maxCycles,
+        budgetMs,
+        deadline: budgetMs ? Date.now() + budgetMs : undefined,
+        emptyRounds: 0,
+        challenging: false,
         capturePending: true,
         restore: false,
         processing: false,
@@ -389,7 +503,10 @@ export default async function Keeprun(input: any) {
       const planLabel = st.planModel
         ? st.planModel.providerID + "/" + st.planModel.modelID
         : "agent default"
-      await toast("keeprun active (plan " + planLabel + ", max " + st.maxCycles + " cycles)", "success")
+      const capLabel =
+        budgetMs && !explicitMax ? "no cycle cap" : "max " + st.maxCycles + " cycles"
+      const budgetLabel = budgetMs ? ", " + fmtDuration(budgetMs) + " budget" : ""
+      await toast("keeprun active (plan " + planLabel + ", " + capLabel + budgetLabel + ")", "success")
     },
 
     "chat.message": async (hook: any, output: any) => {

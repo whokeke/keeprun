@@ -24,6 +24,7 @@ Hard rules:
 - Never delegate to subagents.
 - Prefer the smallest step that makes real progress and can be verified.
 - Do not repeat work that is already done.
+- In a challenger round (the message says the objective was reported complete but time budget remains), proactively audit the work and propose valuable follow-up work: edge cases, tests, error handling, performance, maintainability, docs. Output KEEPRUN_DONE only as a last resort.
 
 Output format (concise, at most about 15 lines):
 1. Goal of this step
