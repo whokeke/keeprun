@@ -1,9 +1,9 @@
-import { readFile, stat } from "node:fs/promises"
-import { basename, isAbsolute, resolve } from "node:path"
+import { mkdir, readFile, stat, writeFile } from "node:fs/promises"
+import { basename, isAbsolute, join, resolve } from "node:path"
 
 type ModelRef = { providerID: string; modelID: string }
 
-type Phase = "ack" | "plan" | "build" | "handoff"
+type Phase = "ack" | "plan" | "build" | "handoff" | "summary"
 
 type St = {
   active: boolean
@@ -15,6 +15,13 @@ type St = {
   goalPath?: string
   goalMtimeMs?: number
   goalWarned: boolean
+  startedAt: number
+  outDir?: string
+  summaryOn: boolean
+  summarizing: boolean
+  stopReason?: string
+  pendingStop?: string
+  summaryPath?: string
   cycles: number
   maxCycles: number
   budgetMs?: number
@@ -40,6 +47,7 @@ const WATCHDOG_MS = 30 * 60 * 1000
 
 const CONTEXT_ERROR_RE = /context limit|exceeds the context|context length|too many tokens|maximum context/i
 const HANDOFF_MARK = "KEEPRUN_HANDOFF"
+const SUMMARY_MARK = "KEEPRUN_SUMMARY"
 
 const MARK_START = "KEEPRUN_START"
 const MARK_READY = "KEEPRUN_PLAN_READY"
@@ -93,6 +101,7 @@ function parseArgs(raw: string) {
   let forMs: number | undefined
   let forInvalid = false
   let goal: string | undefined
+  let out: string | undefined
   let task = raw || ""
   task = task.replace(/--plan-model=(\S+)/g, (_, v) => {
     planModel = parseModel(v)
@@ -115,8 +124,12 @@ function parseArgs(raw: string) {
     goal = q1 !== undefined ? q1 : q2 !== undefined ? q2 : q3
     return ""
   })
+  task = task.replace(/--out=(?:"([^"]*)"|'([^']*)'|(\S+))/g, (_, q1, q2, q3) => {
+    out = q1 !== undefined ? q1 : q2 !== undefined ? q2 : q3
+    return ""
+  })
   task = task.replace(/\s+/g, " ").trim()
-  return { task, planModel, buildModel, max, forMs, forInvalid, goal }
+  return { task, planModel, buildModel, max, forMs, forInvalid, goal, out }
 }
 
 function unwrap(res: any): any {
@@ -172,6 +185,10 @@ export default async function Keeprun(input: any) {
   const defaultMax = Number.isFinite(envMax) && envMax > 0 ? envMax : DEFAULT_MAX_CYCLES
   const defaultBudget = parseDuration(process.env.KEEPRUN_FOR)
   const envGoal = process.env.KEEPRUN_GOAL
+  const envOut = process.env.KEEPRUN_OUT
+  const summaryDisabled = ["0", "off", "false", "no"].includes(
+    (process.env.KEEPRUN_SUMMARY || "").trim().toLowerCase(),
+  )
   const directory: string | undefined = input?.directory
 
   async function toast(message: string, variant: "info" | "success" | "warning" | "error" = "info") {
@@ -264,15 +281,114 @@ export default async function Keeprun(input: any) {
     return false
   }
 
+  function stamp(date = new Date()): string {
+    const p = (n: number) => String(n).padStart(2, "0")
+    return (
+      String(date.getFullYear()) +
+      p(date.getMonth() + 1) +
+      p(date.getDate()) +
+      "-" +
+      p(date.getHours()) +
+      p(date.getMinutes()) +
+      p(date.getSeconds())
+    )
+  }
+
+  async function pathExists(path: string): Promise<boolean> {
+    try {
+      await stat(path)
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  async function writeDoc(st: St, name: string, body: string): Promise<string | undefined> {
+    try {
+      if (st.outDir) {
+        await mkdir(st.outDir, { recursive: true })
+        const path = join(st.outDir, name)
+        await writeFile(path, body, "utf8")
+        return path
+      }
+      if (name !== "summary.md") return undefined
+      const base = directory || process.cwd()
+      const stem = "summary-" + stamp()
+      let path = join(base, stem + ".md")
+      for (let i = 2; await pathExists(path); i++) path = join(base, stem + "-" + i + ".md")
+      await writeFile(path, body, "utf8")
+      return path
+    } catch (error) {
+      await toast("document write failed: " + errText(error), "warning")
+      return undefined
+    }
+  }
+
+  function metaHeader(st: St, reason: string): string {
+    const plan = st.planModel ? st.planModel.providerID + "/" + st.planModel.modelID : "agent default"
+    const build = st.buildModel ? st.buildModel.providerID + "/" + st.buildModel.modelID : "auto"
+    return [
+      "---",
+      "task: " + JSON.stringify(st.task),
+      "goal: " + (st.goalPath || "(task text)"),
+      "plan_model: " + plan,
+      "build_model: " + build,
+      "duration: " + fmtDuration(Date.now() - st.startedAt),
+      "cycles: " + st.cycles,
+      "handoffs: " + st.handoffs,
+      "stop_reason: " + reason,
+      "---",
+      "",
+    ].join("\n")
+  }
+
+  async function transcriptBlock(sessionID: string, st: St): Promise<string> {
+    const list = await loadMessages(sessionID, 8)
+    const chunks: string[] = []
+    for (const m of list) {
+      const text = (m?.parts || [])
+        .filter((part: any) => part?.type === "text")
+        .map((part: any) => part.text || "")
+        .join(" ")
+        .trim()
+      if (text) chunks.push(String(m?.info?.role || "?") + ": " + text.slice(0, 1200))
+    }
+    return chunks.length ? "Recent transcript:\n" + chunks.join("\n") : "Recent transcript: (unavailable)"
+  }
+
   async function stop(sessionID: string, st: St, reason: string) {
+    if (states.get(sessionID) !== st) return
+    if (st.active && !st.summarizing && st.summaryOn) {
+      st.summarizing = true
+      st.stopReason = reason
+      await sendSummary(sessionID, st, reason)
+      return
+    }
+    await finishStop(sessionID, st, reason)
+  }
+
+  async function finishStop(sessionID: string, st: St, reason: string) {
     if (states.get(sessionID) !== st) return
     states.delete(sessionID)
     st.active = false
     clearWatchdog(st)
-    const done = reason.includes("complete")
-    await toast("stopped: " + reason, done ? "success" : "warning")
+    const finalReason = st.stopReason || reason
+    if (st.summaryOn && !st.summaryPath) {
+      const body =
+        metaHeader(st, finalReason) +
+        "# keeprun 总结（插件生成）\n\n停止原因：" +
+        finalReason +
+        "\n\n" +
+        (await transcriptBlock(sessionID, st)) +
+        "\n"
+      st.summaryPath = await writeDoc(st, "summary.md", body)
+    }
+    const done = finalReason.includes("complete")
+    if (st.summaryPath) await toast("summary written: " + st.summaryPath, "success")
+    await toast("stopped: " + finalReason, done ? "success" : "warning")
+    const summaryNote = st.summaryPath ? " Docs: " + st.summaryPath + "." : ""
     if (await needsRestore(sessionID, st)) {
-      await restoreSession(sessionID, st, "KEEPRUN stopped (" + reason + "). Session restored to build.")
+      await restoreSession(sessionID, st, "KEEPRUN stopped (" + finalReason + ")." + summaryNote + " Session restored to build.")
     } else {
       await setPermissions(sessionID, UNHARDEN)
     }
@@ -424,6 +540,44 @@ export default async function Keeprun(input: any) {
     })
   }
 
+  async function sendSummary(sessionID: string, st: St, reason: string) {
+    st.phase = "summary"
+    await checkGoalChanged(st)
+    const text = [
+      "KEEPRUN summary phase.",
+      "",
+      "The run is stopping: " + reason + ".",
+      "Task: " + st.task,
+      ...goalLines(st),
+      "",
+      "State: " +
+        st.cycles +
+        " build step(s) completed; " +
+        st.handoffs +
+        " context handoff(s); duration " +
+        fmtDuration(Date.now() - st.startedAt) +
+        ".",
+      st.deadline ? "Time budget remaining at stop: " + fmtDuration(Math.max(0, st.deadline - Date.now())) + "." : "",
+      "",
+      "Write the final summary document for the user, in the same language as the task (default Chinese). Sections:",
+      "1. 结论：对照最终目标，本次运行达成到什么程度。",
+      "2. 已完成的工作与验证结果（证据：测试、基准数据、文件、commit）。",
+      "3. 关键改动清单（文件/模块）。",
+      "4. 未完成事项与后续建议（按优先级）。",
+      "5. 遇到的问题与坑。",
+      "",
+      "You are read-only; do not modify anything. Output markdown only.",
+      "End with " + SUMMARY_MARK + " on its own final line.",
+    ]
+      .filter(Boolean)
+      .join("\n")
+    await dispatch(sessionID, st, {
+      agent: PLAN_AGENT,
+      ...(st.planModel ? { model: st.planModel } : {}),
+      parts: [{ type: "text", text }],
+    })
+  }
+
   async function sendHandoff(sessionID: string, st: St) {
     st.phase = "handoff"
     await checkGoalChanged(st)
@@ -456,16 +610,6 @@ export default async function Keeprun(input: any) {
   }
 
   async function fallbackHandoff(sessionID: string, st: St): Promise<string> {
-    const list = await loadMessages(sessionID, 8)
-    const chunks: string[] = []
-    for (const m of list) {
-      const text = (m?.parts || [])
-        .filter((part: any) => part?.type === "text")
-        .map((part: any) => part.text || "")
-        .join(" ")
-        .trim()
-      if (text) chunks.push(String(m?.info?.role || "?") + ": " + text.slice(0, 1200))
-    }
     return [
       "Handoff generated by the keeprun plugin (the model-written handoff was unavailable).",
       "",
@@ -475,8 +619,7 @@ export default async function Keeprun(input: any) {
       "Cycles completed: " + st.cycles,
       ...(st.deadline ? ["Time budget remaining: " + fmtDuration(st.deadline - Date.now())] : []),
       "",
-      "Recent transcript:",
-      ...chunks,
+      await transcriptBlock(sessionID, st),
     ].join("\n")
   }
 
@@ -513,6 +656,13 @@ export default async function Keeprun(input: any) {
       if (!newID) throw new Error("session.create returned no id")
     } catch (error) {
       return await stop(oldID, st, "handoff failed: " + errText(error))
+    }
+
+    if (st.outDir) {
+      const header =
+        "---\nhandoff: " + st.handoffs + "\nfrom: " + oldID + "\nto: " + newID + "\nreason: context limit\n---\n\n"
+      const path = await writeDoc(st, "handoff-" + st.handoffs + ".md", header + doc.trim() + "\n")
+      if (path) await toast("handoff doc: " + path, "info")
     }
 
     states.delete(oldID)
@@ -576,7 +726,7 @@ export default async function Keeprun(input: any) {
       st.lastAssistantID = id
       clearWatchdog(st)
 
-      if (st.deadline && Date.now() >= st.deadline) {
+      if (st.deadline && Date.now() >= st.deadline && st.phase !== "summary") {
         return await stop(sessionID, st, "time budget exhausted (" + fmtDuration(st.budgetMs || 0) + ")")
       }
 
@@ -593,13 +743,22 @@ export default async function Keeprun(input: any) {
           if (st.phase === "handoff") {
             return await migrateToNewSession(sessionID, st, await fallbackHandoff(sessionID, st))
           }
+          if (st.phase === "summary") {
+            return await stop(sessionID, st, st.stopReason || "summary failed (context limit)")
+          }
           return await startHandoff(sessionID, st, true)
         } else {
           return await stop(sessionID, st, "assistant error: " + (name || "unknown"))
         }
       }
 
-      if (st.overflowed) {
+      if (st.pendingStop && st.phase !== "summary") {
+        const reason = st.pendingStop
+        st.pendingStop = undefined
+        return await stop(sessionID, st, reason)
+      }
+
+      if (st.overflowed && st.phase !== "summary") {
         return await startHandoff(sessionID, st, false)
       }
 
@@ -622,6 +781,24 @@ export default async function Keeprun(input: any) {
           .join("\n")
           .trim()
         return await migrateToNewSession(sessionID, st, doc || (await fallbackHandoff(sessionID, st)))
+      }
+
+      if (st.phase === "summary") {
+        const doc = text
+          .split(/\r?\n/)
+          .filter(
+            (line) =>
+              line
+                .trim()
+                .replace(/^[>*#`_\-\s]+/, "")
+                .replace(/[`_*\s]+$/, "") !== SUMMARY_MARK,
+          )
+          .join("\n")
+          .trim()
+        const reason = st.stopReason || "stopped"
+        const content = doc || "# keeprun 总结（插件生成）\n\n" + (await transcriptBlock(sessionID, st))
+        st.summaryPath = await writeDoc(st, "summary.md", metaHeader(st, reason) + content + "\n")
+        return await finishStop(sessionID, st, reason)
       }
 
       if (st.phase === "ack") {
@@ -680,10 +857,12 @@ export default async function Keeprun(input: any) {
           await toast("keeprun is not active", "info")
           return
         }
-        st.active = false
-        st.restore = true
-        clearWatchdog(st)
-        await toast("keeprun stopping", "info")
+        if (st.phase === "summary" || st.summarizing) {
+          await toast("keeprun is already stopping", "info")
+          return
+        }
+        st.pendingStop = "stopped by user (/keepstop)"
+        await toast("keeprun stopping after this round; docs will be written on exit", "info")
         return
       }
 
@@ -698,6 +877,18 @@ export default async function Keeprun(input: any) {
       const maxCycles = explicitMax ?? (budgetMs ? Infinity : defaultMax)
       const taskText = parsed.task || "(continue the current conversation task)"
       const goal = await resolveGoal(parsed.goal ?? envGoal, taskText)
+
+      let outDir: string | undefined
+      const rawOut = ((parsed.out ?? envOut) || "").trim()
+      if (rawOut) {
+        const base = directory || process.cwd()
+        const outBase = isAbsolute(rawOut) ? rawOut : resolve(base, rawOut)
+        const stem = "run-" + stamp()
+        let candidate = join(outBase, stem)
+        for (let i = 2; await pathExists(candidate); i++) candidate = join(outBase, stem + "-" + i)
+        outDir = candidate
+      }
+
       const previous = states.get(sessionID)
       if (previous) clearWatchdog(previous)
       const st: St = {
@@ -710,6 +901,10 @@ export default async function Keeprun(input: any) {
         goalPath: goal.path,
         goalMtimeMs: goal.mtimeMs,
         goalWarned: false,
+        startedAt: Date.now(),
+        outDir,
+        summaryOn: outDir ? true : !summaryDisabled,
+        summarizing: false,
         cycles: 0,
         maxCycles,
         budgetMs,
@@ -721,6 +916,23 @@ export default async function Keeprun(input: any) {
         capturePending: true,
         restore: false,
         processing: false,
+      }
+      if (outDir) {
+        try {
+          await mkdir(outDir, { recursive: true })
+          const goalDoc = [
+            "# keeprun 最终目标",
+            goal.path ? "Source: " + goal.path + " (snapshot taken at start)" : "(inline goal / task text)",
+            "",
+            goal.text,
+            "",
+          ].join("\n")
+          await writeFile(join(outDir, "goal.md"), goalDoc, "utf8")
+        } catch (error) {
+          await toast("could not create docs dir: " + errText(error), "warning")
+          outDir = undefined
+          st.outDir = undefined
+        }
       }
       states.set(sessionID, st)
       await setPermissions(sessionID, HARDEN)
@@ -742,8 +954,9 @@ export default async function Keeprun(input: any) {
         budgetMs && !explicitMax ? "no cycle cap" : "max " + st.maxCycles + " cycles"
       const budgetLabel = budgetMs ? ", " + fmtDuration(budgetMs) + " budget" : ""
       const goalLabel = st.goalPath ? ", goal " + basename(st.goalPath) : ""
+      const docsLabel = st.outDir ? ", docs " + st.outDir : ""
       await toast(
-        "keeprun active (plan " + planLabel + ", " + capLabel + budgetLabel + goalLabel + ")",
+        "keeprun active (plan " + planLabel + ", " + capLabel + budgetLabel + goalLabel + docsLabel + ")",
         "success",
       )
     },
@@ -789,6 +1002,15 @@ export default async function Keeprun(input: any) {
           if (st) {
             clearWatchdog(st)
             states.delete(id)
+            if (st.summaryOn && !st.summaryPath) {
+              const reason = st.stopReason || "session deleted"
+              st.summaryPath = await writeDoc(
+                st,
+                "summary.md",
+                metaHeader(st, reason) + "# keeprun 总结（会话被删除）\n\n停止原因：" + reason + "\n",
+              )
+              if (st.summaryPath) await toast("summary written: " + st.summaryPath, "warning")
+            }
           }
         }
       } catch {}

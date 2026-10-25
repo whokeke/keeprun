@@ -32,6 +32,8 @@ opencode 原生在每一轮 assistant 回复结束后进入 `idle`，等待用�
 | 完成后续跑 | 预算未耗尽时 `KEEPRUN_DONE` 触发**追问者（challenger）轮**，由强模型审查并挖掘新任务 |
 | 最终目标 | `--goal="文本"` 或 `--goal=@goal.md`（文档，相对 worktree，16KB 截断）；启动时快照，运行中不允许修改（改动仅告警，不改变目标） |
 | 上下文溢出 | 识别 `ContextOverflowError`/溢出文本 → 自动 compact → 强模型写交接文档 → **新建 session** 继续同一 keeprun（`MAX_HANDOFFS=5`） |
+| 运行文档 | `--out=<dir>`：本次运行全部文档收集到 `<dir>/run-<时间戳>/`（`goal.md`/`handoff-<N>.md`/`summary.md`）；缺省仅把 `summary-<时间戳>.md` 写到工作区根 |
+| 结束总结 | 任一停止路径先派发**总结轮**（强模型按模板撰写，失败机械兜底），落盘后 toast/恢复提示给出路径，再真正停止 |
 | 规划模型 | 默认 `deepseek/GLM-5.3`，可通过参数/环境变量/agent 文件修改 |
 | 实施阶段 | 内置 `build` agent + `/keeprun` 前的**原模型** |
 | 零打断加固 | `doom_loop: allow` + `question: deny`（keeprun 会话级） |
@@ -158,7 +160,7 @@ const taskModel =
 ### 5.1 状态
 
 ```ts
-type Phase = "ack" | "plan" | "build" | "handoff"
+type Phase = "ack" | "plan" | "build" | "handoff" | "summary"
 
 type St = {
   active: boolean
@@ -178,6 +180,13 @@ type St = {
   challenging: boolean      // 当前是否处于追问者轮
   overflowed: boolean       // 收到 ContextOverflowError，待本轮结束后交接
   handoffs: number          // 已执行交接次数
+  startedAt: number         // /keeprun 启动时间（用于总结时长）
+  outDir?: string           // --out 解析出的本次运行文档目录
+  summaryOn: boolean        // 是否生成总结（--out 隐含开启；KEEPRUN_SUMMARY=off 关闭默认路径）
+  summarizing: boolean      // stop() 已转入总结阶段，防重入
+  stopReason?: string       // 触发的停止原因（贯穿总结阶段）
+  pendingStop?: string      // /keepstop 请求，待本轮 idle 消费
+  summaryPath?: string      // 已写出的总结文件
   lastAssistantID?: string  // 去重
   capturePending: boolean    // 等待捕获原模型
   restore: boolean           // /keepstop 后待恢复
@@ -235,8 +244,14 @@ type St = {
   A. session.error 为 ContextOverflowError → 只置 overflowed=true（opencode 自动 compact 并续完本轮）
   B. assistant error 为 ContextOverflowError 或文本匹配溢出 → 直接进入交接（先 summarize 压缩）
   → idle 时若 overflowed / 进入交接 → handoff 轮（keeprun-plan 写交接文档，结尾 KEEPRUN_HANDOFF）
-  → 捕获文档 → session.create 新会话 → HARDEN + noReply 注入交接文档 → 新会话继续 plan 轮
-  → 旧会话 UNHARDEN 并留迁移提示；deadline/cycles/models/goal 快照全部携带；handoffs > 5 停止
+  → 捕获文档 → （--out 时落盘 handoff-<N>.md）→ session.create 新会话 → HARDEN + noReply 注入交接文档
+  → 新会话继续 plan 轮；旧会话 UNHARDEN 并留迁移提示；deadline/cycles/models/goal 快照全部携带；handoffs > 5 停止
+
+停止与总结（任一停止原因：完成/到期/追问者无工作/触顶/BLOCKED/交接超限/keepstop/错误）：
+  stop(reason) →（summaryOn）→ phase=summary，派发总结轮（keeprun-plan，结尾 KEEPRUN_SUMMARY）
+  → idle(summary)：剥离标记 → 元数据头 + 正文 → 落盘（summary.md 或 summary-<时间戳>.md）
+  → finishStop：状态清理 + toast 路径 + 恢复会话（提示含文档路径）
+  总结轮失败/看门狗/会话删除 → 机械兜底总结（元数据 + 最近对话），保证总有文档
 ```
 
 每轮 idle 都会先检查 `Date.now() >= deadline`；plan/build 提示词中附带剩余时间与最终目标，让模型感知预算与方向。
@@ -275,7 +290,9 @@ type St = {
 | `isContextError` | `name === "ContextOverflowError"` 或错误文本匹配溢出模式 |
 | `sendHandoff` / `fallbackHandoff` | 让强模型写交接文档；模型轮失败时用最近对话生成兜底文档 |
 | `startHandoff` | 计数与上限检查；需要时先 `session.summarize` 压缩，再派发 handoff 轮 |
-| `migrateToNewSession` | `session.create` 新会话、迁移状态、HARDEN、注入交接上下文并继续 plan 轮 |
+| `migrateToNewSession` | `session.create` 新会话、迁移状态、HARDEN、注入交接上下文并继续 plan 轮；`--out` 时落盘交接文档 |
+| `sendSummary` / `finishStop` | 停止前总结轮；落盘后清理状态、toast 路径、恢复会话；总结缺失时机械兜底 |
+| `writeDoc` / `metaHeader` / `transcriptBlock` | 运行文档写入（run 子目录或工作区根）、总结元数据头、最近对话摘要 |
 | `setPermissions` | 调 `client.session.update({body:{permission:[...]}})`；SDK 类型偏旧，使用 `as any` |
 | `loadMessages` / `lastAssistant` / `lastUserModel` | 读取最近消息、最后 assistant、最后 user 的模型 |
 | `sendPlan` | 设置 `phase=plan`，注入规划消息 |
@@ -296,6 +313,7 @@ type St = {
 | `KEEPRUN_BLOCKED: <question>` | plan 轮 | 确需用户决策，停止 |
 | `KEEPRUN_CONTINUE` | build 轮 | 本步完成但任务未结束（插件即使没看到也默认继续） |
 | `KEEPRUN_HANDOFF` | handoff 轮 | 交接文档结束标记（插件也会直接取该轮文本作为文档） |
+| `KEEPRUN_SUMMARY` | summary 轮 | 结束总结文档结束标记 |
 
 判定规则（`markerOf`）：
 
@@ -325,7 +343,8 @@ type St = {
 - 完成但预算未耗尽：`KEEPRUN_DONE` 不停止，转入追问者轮；追问者连续 5 轮（`CHALLENGER_EMPTY_LIMIT`）仍无产出才停止（`challenger found no further work`），防止空转烧 token。
 - 上下文溢出：`ContextOverflowError` 事件只标记不停止（opencode 自动 compact 并继续）；ai 消息上的溢出错误触发一次 compact 后交接；交接最多 5 次（`MAX_HANDOFFS`），超出停止（`too many context handoffs`）。
 - 交接失败（`session.create` 失败）→ 停止并提示；旧会话始终解除加固并提示新会话 id。
-- 手动 `/keepstop`：置 `active=false, restore=true`，在随后的 idle 恢复。
+- 结束总结：所有停止路径先进入 `summary` 阶段（强模型撰写，元数据头由插件写入）；总结轮失败/超时/会话删除 → 机械兜底，保证落盘；`KEEPRUN_SUMMARY=off` 且无 `--out` 时跳过总结轮。
+- 手动 `/keepstop`：置 `pendingStop`，本轮 idle 时转入停止+总结（不再直接置 `active=false`）。
 
 ### 6.5 会话级“零打断”加固
 
@@ -440,6 +459,8 @@ KEEPRUN is being stopped. Confirm in one short sentence and do not start new wor
 | 目标文档截断 | 16KB | 常量 `GOAL_DOC_CHAR_LIMIT` |
 | 追问者空转上限 | 5 | 代码常量 `CHALLENGER_EMPTY_LIMIT` |
 | 交接次数上限 | 5 | 代码常量 `MAX_HANDOFFS` |
+| 运行文档目录 | 无（仅工作区根 summary） | `--out=<dir>`；或环境变量 `KEEPRUN_OUT`；自动建 `run-<时间戳>/` 子目录 |
+| 结束总结 | 开 | `KEEPRUN_SUMMARY=off` 关闭默认总结；显式 `--out` 视为开启 |
 | 看门狗 | 30 分钟 | 代码常量 `WATCHDOG_MS` |
 
 优先级：命令行参数 > 环境变量 > agent frontmatter。
@@ -462,6 +483,7 @@ KEEPRUN is being stopped. Confirm in one short sentence and do not start new wor
 8. **需重启生效**：插件/命令在启动时加载，当前正在运行的会话不会热加载。
 9. **交接后的新会话**：keeprun 通过 API 驱动新会话，但 TUI 需手动切换过去查看；旧会话会留一条含新会话 id 的迁移提示。
 10. **目标文档不可变**：`--goal=@file` 在启动时快照；运行中修改文件只告警、不改变目标。需要换目标时先 `/keepstop` 再重新 `/keeprun`。
+11. **文档与仓库污染**：`--out` 目录（含 `run-*` 子目录）由使用者选择；缺省总结写在**工作区根** `summary-<时间戳>.md`，如不希望入库请加入 `.gitignore` 或改用 `--out` 指向忽略目录。
 
 ---
 
@@ -506,6 +528,9 @@ opencode debug config
 - `ContextOverflowError` 事件只标记不停止；
 - 溢出错误 → compact（`session.summarize`）→ handoff 轮 → `session.create` 新会话迁移（状态/deadline/goal 保留、旧会话解除加固）；
 - handoff 轮再溢出 → 兜底文档仍完成迁移；`MAX_HANDOFFS` 触顶停止。
+- `--out`：启动时建 `run-<时间戳>/` 并写 `goal.md`；完成停止写 `summary.md`（元数据头 + 正文）；交接写 `handoff-<N>.md`；
+- 无 `--out`：停止时写工作区根 `summary-<时间戳>.md`；`KEEPRUN_SUMMARY=off` 时不再派发总结轮、不写文件；
+- 总结轮失败/错误 → 机械兜底仍是文件；`/keepstop` → 本轮结束后停止并总结。
 
 全部通过。仓库内测试：`node test/state-machine.test.mjs`。
 
@@ -519,6 +544,7 @@ opencode debug config
    ```text
    /keeprun 修复 AArch64 LSO 的 ldp 配对回归
    /keeprun 完成任务 --plan-model=gptplus/claude-opus-4-6-thinking-aws --max=10
+   /keeprun 推进 S1 --for=8h --goal=@doc/final_goal-v1.md --out=doc/keeprun
    ```
 
 3. 观察会话自动切换：

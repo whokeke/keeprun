@@ -1,5 +1,5 @@
 import assert from "node:assert"
-import { mkdtemp, rm, writeFile } from "node:fs/promises"
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import plugin, { parseDuration, fmtDuration } from "../plugins/keeprun.ts"
@@ -8,6 +8,8 @@ delete process.env.KEEPRUN_FOR
 delete process.env.KEEPRUN_PLAN_MODEL
 delete process.env.KEEPRUN_MAX_CYCLES
 delete process.env.KEEPRUN_GOAL
+delete process.env.KEEPRUN_OUT
+delete process.env.KEEPRUN_SUMMARY
 
 const realExit = process.exit.bind(process)
 const results = []
@@ -114,9 +116,18 @@ function harness() {
   return h
 }
 
-async function start(h, args) {
-  h.instance = await plugin({ client: h.client, directory: process.cwd() })
+async function start(h, args, opts = {}) {
+  const prevSummary = process.env.KEEPRUN_SUMMARY
+  const prevOut = process.env.KEEPRUN_OUT
+  process.env.KEEPRUN_SUMMARY = opts.summary ? "on" : "off"
+  if (opts.out) process.env.KEEPRUN_OUT = opts.out
+  else delete process.env.KEEPRUN_OUT
+  h.instance = await plugin({ client: h.client, directory: opts.directory || process.cwd() })
   h.output = { parts: [{ type: "text", text: "placeholder" }] }
+  if (prevSummary === undefined) delete process.env.KEEPRUN_SUMMARY
+  else process.env.KEEPRUN_SUMMARY = prevSummary
+  if (prevOut === undefined) delete process.env.KEEPRUN_OUT
+  else process.env.KEEPRUN_OUT = prevOut
   await h.instance["command.execute.before"](
     { command: "keeprun", sessionID: "s1", arguments: args },
     h.output,
@@ -417,6 +428,141 @@ await check("handoff attempts are capped", async () => {
   }
   assert.equal(h.created.length, 5)
   assert.match(String(lastToast(h).message), /stopped: too many context handoffs \(5\)/)
+})
+
+async function runDirOf(base) {
+  const runs = (await readdir(base)).filter((name) => name.startsWith("run-"))
+  assert.equal(runs.length, 1)
+  return join(base, runs[0])
+}
+
+await check("--out collects goal.md and summary.md", async () => {
+  const outBase = await mkdtemp(join(tmpdir(), "keeprun-out-"))
+  const h = harness()
+  await start(h, "do X --out=" + outBase)
+  const runDir = await runDirOf(outBase)
+  const goal = await readFile(join(runDir, "goal.md"), "utf8")
+  assert.match(goal, /do X/)
+  assert.doesNotMatch(goal, /--out/)
+
+  assistant(h, "KEEPRUN_START")
+  await idle(h)
+  assistant(h, "KEEPRUN_DONE")
+  await idle(h)
+  assert.match(promptText(lastPromptBody(h)), /KEEPRUN summary phase/)
+  assert.match(promptText(lastPromptBody(h)), /task complete/)
+  assistant(h, "SUMMARY BODY\nKEEPRUN_SUMMARY")
+  await idle(h)
+
+  const summary = await readFile(join(runDir, "summary.md"), "utf8")
+  assert.match(summary, /stop_reason: task complete \(planner\)/)
+  assert.match(summary, /SUMMARY BODY/)
+  assert.doesNotMatch(summary, /KEEPRUN_SUMMARY/)
+  assert.match(summary, /cycles: 0/)
+  assert.equal(stopped(h), true)
+  assert.ok(h.toasts.some((t) => /summary written: .*summary\.md/.test(String(t.message))))
+  assert.ok(h.toasts.some((t) => /docs .*run-/.test(String(t.message))))
+  await rm(outBase, { recursive: true, force: true })
+})
+
+await check("--out writes each handoff document", async () => {
+  const outBase = await mkdtemp(join(tmpdir(), "keeprun-out-"))
+  const h = harness()
+  await start(h, "do X --for=8h --out=" + outBase)
+  assistant(h, "KEEPRUN_START")
+  await idle(h)
+  await emit(h, "session.error", {
+    sessionID: "s1",
+    error: { name: "ContextOverflowError", data: { message: "overflow" } },
+  })
+  assistant(h, "round finished")
+  await idle(h)
+  assert.match(promptText(lastPromptBody(h)), /KEEPRUN handoff phase/)
+  assistant(h, "HANDOFF BODY\nKEEPRUN_HANDOFF")
+  await idle(h)
+
+  const runDir = await runDirOf(outBase)
+  const handoff = await readFile(join(runDir, "handoff-1.md"), "utf8")
+  assert.match(handoff, /handoff: 1/)
+  assert.match(handoff, /from: s1/)
+  assert.match(handoff, /to: n1/)
+  assert.match(handoff, /HANDOFF BODY/)
+  await rm(outBase, { recursive: true, force: true })
+})
+
+await check("/keepstop stops after the round and writes a summary", async () => {
+  const outBase = await mkdtemp(join(tmpdir(), "keeprun-out-"))
+  const h = harness()
+  await start(h, "do X --out=" + outBase)
+  assistant(h, "KEEPRUN_START")
+  await idle(h)
+  await h.instance["command.execute.before"]({ command: "keepstop", sessionID: "s1", arguments: "" }, { parts: [] })
+  assert.equal(stopped(h), false)
+  assistant(h, "round finished")
+  await idle(h)
+  assert.match(promptText(lastPromptBody(h)), /KEEPRUN summary phase/)
+  assert.match(promptText(lastPromptBody(h)), /stopped by user/)
+  assistant(h, "STOP SUMMARY\nKEEPRUN_SUMMARY")
+  await idle(h)
+  const summary = await readFile(join(await runDirOf(outBase), "summary.md"), "utf8")
+  assert.match(summary, /stop_reason: stopped by user/)
+  assert.match(summary, /STOP SUMMARY/)
+  assert.match(String(lastToast(h).message), /stopped: stopped by user/)
+  await rm(outBase, { recursive: true, force: true })
+})
+
+await check("failed summary round falls back to a plugin-generated summary", async () => {
+  const outBase = await mkdtemp(join(tmpdir(), "keeprun-out-"))
+  const h = harness()
+  await start(h, "do X --out=" + outBase)
+  assistant(h, "KEEPRUN_START")
+  await idle(h)
+  assistant(h, "KEEPRUN_DONE")
+  await idle(h)
+  assert.match(promptText(lastPromptBody(h)), /KEEPRUN summary phase/)
+  assistantError(h, { name: "APIError", data: { message: "boom" } })
+  await idle(h)
+  const summary = await readFile(join(await runDirOf(outBase), "summary.md"), "utf8")
+  assert.match(summary, /keeprun 总结（插件生成）/)
+  assert.match(summary, /stop_reason: task complete/)
+  assert.equal(stopped(h), true)
+  await rm(outBase, { recursive: true, force: true })
+})
+
+await check("summary is written to the workspace root without --out", async () => {
+  const base = await mkdtemp(join(tmpdir(), "keeprun-base-"))
+  const h = harness()
+  await start(h, "do X", { summary: true, directory: base })
+  assistant(h, "KEEPRUN_START")
+  await idle(h)
+  assistant(h, "KEEPRUN_DONE")
+  await idle(h)
+  assert.match(promptText(lastPromptBody(h)), /KEEPRUN summary phase/)
+  assistant(h, "ROOT SUMMARY\nKEEPRUN_SUMMARY")
+  await idle(h)
+  const files = (await readdir(base)).filter((n) => /^summary-\d{8}-\d{6}(-\d+)?\.md$/.test(n))
+  assert.equal(files.length, 1)
+  const summary = await readFile(join(base, files[0]), "utf8")
+  assert.match(summary, /ROOT SUMMARY/)
+  assert.match(summary, /stop_reason: task complete/)
+  await rm(base, { recursive: true, force: true })
+})
+
+await check("BLOCKED stop reason is recorded in the summary metadata", async () => {
+  const outBase = await mkdtemp(join(tmpdir(), "keeprun-out-"))
+  const h = harness()
+  await start(h, "do X --out=" + outBase)
+  assistant(h, "KEEPRUN_START")
+  await idle(h)
+  assistant(h, "KEEPRUN_BLOCKED: need credentials")
+  await idle(h)
+  assert.match(promptText(lastPromptBody(h)), /KEEPRUN summary phase/)
+  assistant(h, "BLOCKED SUMMARY\nKEEPRUN_SUMMARY")
+  await idle(h)
+  const summary = await readFile(join(await runDirOf(outBase), "summary.md"), "utf8")
+  assert.match(summary, /stop_reason: needs human decision \(planner\)/)
+  assert.match(summary, /BLOCKED SUMMARY/)
+  await rm(outBase, { recursive: true, force: true })
 })
 
 await rm(goalDir, { recursive: true, force: true })
