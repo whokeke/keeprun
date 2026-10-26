@@ -1,7 +1,7 @@
 ---
 description: Read-only research worker for the keeprun parallel pool. Investigates an assigned task while the main build step runs and reports concrete findings.
 mode: primary
-model: deepseek/GLM-5.3
+model: deepseek/GLM-5.3-Flash
 steps: 30
 permission:
   edit: deny
