@@ -354,6 +354,7 @@ type St = {
 - 看门狗：**静默超时**而非轮次超时。`dispatch` 设默认 2 小时（`--watchdog`/`KEEPRUN_WATCHDOG` 可调）；任何会话活动事件（`message.updated`/`message.part.delta`/`message.part.updated`/`session.status`）都会重置计时器，因此长时间正常工作的 build 轮不会被误杀；只有整段窗口内完全无活动（真挂死）才停止，原因记为 `watchdog: no activity for <时长>`。
 - 停止原因必显：所有停止路径都会在会话中留下 synthetic 提示 `KEEPRUN stopped (<原因>)`（即使无需恢复 agent/model），并 toast；启用文档时同时写 summary。
 - 最大轮数：默认 `maxCycles = Infinity`；仅当显式 `--max=N` 或 `KEEPRUN_MAX_CYCLES` 时按上限停止。激进模式下即使显式上限也忽略。
+- 派发无响应（静默失败）：provider 流错误可能不产生任何 assistant 消息/session.error，`session.idle` 触发时 onIdle 靠 `pendingRound` 标记识别"派发了但没有任何新回复"→ 激进模式 keepGoing 重试、普通模式按可见原因停止（此路径曾是循环无声死亡的漏洞，实战中由 API 预算耗尽触发）。
 - 激进模式（`stop()` 的统一闸门）：`aggressiveAllowsStop(reason)` 只放行 `time budget exhausted`、`stopped by user`、`session deleted`；其余停止原因（BLOCKED、assistant/session 错误、provider auth、aborted、看门狗、交接上限、交接失败、触顶、追问者空转）都转入 `keepGoing()`：toast 告警 + 指数退避（`KEEPRUN_RETRY_MS` 基数，默认 2s，上限 60s）+ 重新派发 plan 轮，并附“假设合理默认值、绕过失败/阻塞路径、不要输出 BLOCKED”的指令。交接上限触顶时重置 `handoffs` 再继续；无 `--for` 时一直跑到 `/keepstop`。
 - 时间预算：每次 idle 先检查 `Date.now() >= deadline`，到期停止（`time budget exhausted`）。
 - 完成但预算未耗尽：`KEEPRUN_DONE` 不停止，转入追问者轮；追问者连续 5 轮（`CHALLENGER_EMPTY_LIMIT`）仍无产出才停止（`challenger found no further work`），防止空转烧 token。

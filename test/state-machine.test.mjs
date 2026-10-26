@@ -853,6 +853,33 @@ await check("--workers flags are stripped from the task", async () => {
   assert.doesNotMatch(ack, /--workers|--worker-model/)
 })
 
+await check("aggressive mode re-dispatches after a silent dispatch failure", async () => {
+  const h = harness()
+  await start(h, "do X --aggressive")
+  assistant(h, "KEEPRUN_START")
+  await idle(h)
+  const planPrompts = () => h.prompts.filter((p) => p.sessionID === "s1" && p.body.agent === "keeprun-plan")
+  assert.equal(planPrompts().length, 1)
+  await idle(h)
+  assert.equal(stopped(h), false)
+  await new Promise((resolve) => setTimeout(resolve, 150))
+  assert.equal(planPrompts().length, 2)
+  const retry = planPrompts().at(-1)
+  assert.match(promptText(retry.body), /Aggressive mode is ON/)
+  assert.match(promptText(retry.body), /dispatch produced no response/)
+})
+
+await check("normal mode surfaces a silent dispatch failure", async () => {
+  const h = harness()
+  await start(h, "do X")
+  assistant(h, "KEEPRUN_START")
+  await idle(h)
+  await idle(h)
+  assert.match(String(lastToast(h).message), /stopped: dispatch produced no response/)
+  const users = h.messagesFor("s1").filter((m) => m.info.role === "user")
+  assert.match(promptText({ parts: users.at(-1).parts }), /KEEPRUN stopped \(dispatch produced no response/)
+})
+
 await rm(goalDir, { recursive: true, force: true })
 
 let failed = 0

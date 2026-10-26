@@ -36,6 +36,7 @@ type St = {
   stopReason?: string
   pendingStop?: string
   summaryPath?: string
+  pendingRound?: boolean
   workers: number
   workerModel?: ModelRef
   workerReports: WorkerReport[]
@@ -711,6 +712,7 @@ export default async function Keeprun(input: any) {
     try {
       const res = await client.session.promptAsync({ path: { id: sessionID }, body })
       if (failed(res)) throw res.error
+      st.pendingRound = true
     } catch (error) {
       await stop(sessionID, st, "prompt failed: " + errText(error))
     }
@@ -1033,9 +1035,16 @@ export default async function Keeprun(input: any) {
     st.processing = true
     try {
       const last = await lastAssistant(sessionID)
-      if (!last) return
-      const id = last.info?.id
-      if (!id || id === st.lastAssistantID) return
+      const noNewAssistant = !last || !last.info?.id || last.info.id === st.lastAssistantID
+      if (noNewAssistant && st.pendingRound && !st.summarizing) {
+        st.pendingRound = false
+        const reason = "dispatch produced no response (provider/stream failure)"
+        if (st.aggressive) return await keepGoing(sessionID, st, reason)
+        return await stop(sessionID, st, reason)
+      }
+      if (noNewAssistant) return
+      st.pendingRound = false
+      const id = last.info!.id
       st.lastAssistantID = id
       clearWatchdog(st)
       clearRetry(st)
