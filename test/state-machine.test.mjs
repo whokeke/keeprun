@@ -67,6 +67,7 @@ function harness() {
     toasts: [],
     permission: {},
     created: [],
+    deleted: [],
     summarized: [],
     seq: 0,
   }
@@ -102,6 +103,10 @@ function harness() {
         h.created.push(req.body)
         return { data: { id: "n" + h.created.length } }
       },
+      delete: async (req) => {
+        h.deleted.push(req.path.id)
+        return { data: true }
+      },
       summarize: async (req) => {
         h.summarized.push({ sessionID: req.path.id, body: req.body })
         return { data: {} }
@@ -118,7 +123,7 @@ function harness() {
 
 async function start(h, args, opts = {}) {
   const saved = {}
-  for (const key of ["KEEPRUN_SUMMARY", "KEEPRUN_OUT", "KEEPRUN_RETRY_MS", "KEEPRUN_AGGRESSIVE", "KEEPRUN_MAX_CYCLES"]) {
+  for (const key of ["KEEPRUN_SUMMARY", "KEEPRUN_OUT", "KEEPRUN_RETRY_MS", "KEEPRUN_AGGRESSIVE", "KEEPRUN_MAX_CYCLES", "KEEPRUN_WORKERS"]) {
     saved[key] = process.env[key]
   }
   process.env.KEEPRUN_SUMMARY = opts.summary ? "on" : "off"
@@ -129,6 +134,8 @@ async function start(h, args, opts = {}) {
   else delete process.env.KEEPRUN_AGGRESSIVE
   if (opts.maxCyclesEnv) process.env.KEEPRUN_MAX_CYCLES = String(opts.maxCyclesEnv)
   else delete process.env.KEEPRUN_MAX_CYCLES
+  if (opts.workersEnv !== undefined) process.env.KEEPRUN_WORKERS = String(opts.workersEnv)
+  else delete process.env.KEEPRUN_WORKERS
   h.instance = await plugin({ client: h.client, directory: opts.directory || process.cwd() })
   h.output = { parts: [{ type: "text", text: "placeholder" }] }
   for (const [key, value] of Object.entries(saved)) {
@@ -741,6 +748,109 @@ await check("KEEPRUN_AGGRESSIVE env enables aggressive mode", async () => {
   assistant(h, "KEEPRUN_BLOCKED: x")
   await idle(h)
   assert.equal(stopped(h), false)
+})
+
+await check("planner-assigned workers run in parallel and report back", async () => {
+  const outBase = await mkdtemp(join(tmpdir(), "keeprun-out-"))
+  const h = harness()
+  await start(h, "do X --out=" + outBase)
+  assistant(h, "KEEPRUN_START")
+  await idle(h)
+  assistant(h, "step 1\nKEEPRUN_WORKER: audit the bzip2 frame layout\nKEEPRUN_WORKER: audit second thing\nKEEPRUN_PLAN_READY")
+  await idle(h)
+  assert.equal(h.created.length, 1)
+  const workerPrompt = h.prompts.find((p) => p.sessionID === "n1")
+  assert.ok(workerPrompt)
+  assert.equal(workerPrompt.body.agent, "keeprun-worker")
+  assert.match(promptText(workerPrompt.body), /audit the bzip2 frame layout/)
+  assert.doesNotMatch(promptText(workerPrompt.body), /audit second thing/)
+  assert.match(promptText(workerPrompt.body), /READ-ONLY/)
+  const buildPrompt = h.prompts.find((p) => p.sessionID === "s1" && p.body.agent === "build")
+  assert.match(promptText(buildPrompt.body), /Ignore any KEEPRUN_WORKER/)
+
+  assistant(h, "finding: frame header is misaligned at lib/x.go:42\nKEEPRUN_WORKER_DONE", "n1")
+  await idle(h, "n1")
+  assert.ok(h.deleted.includes("n1"))
+  const runDir = await runDirOf(outBase)
+  const files = (await readdir(join(runDir, "workers"))).filter((n) => n.endsWith(".md"))
+  assert.equal(files.length, 1)
+  const workerFile = await readFile(join(runDir, "workers", files[0]), "utf8")
+  assert.match(workerFile, /frame header is misaligned/)
+
+  assistant(h, "did step 1\nKEEPRUN_CONTINUE")
+  await idle(h)
+  assert.match(promptText(lastPromptBody(h)), /Worker findings/)
+  assert.match(promptText(lastPromptBody(h)), /frame header is misaligned/)
+  await rm(outBase, { recursive: true, force: true })
+})
+
+await check("--workers=0 disables the pool", async () => {
+  const h = harness()
+  await start(h, "do X --workers=0")
+  assistant(h, "KEEPRUN_START")
+  await idle(h)
+  assert.doesNotMatch(promptText(h.prompts[0].body), /Parallel worker pool/)
+  assistant(h, "KEEPRUN_WORKER: should not run\nKEEPRUN_PLAN_READY")
+  await idle(h)
+  assert.equal(h.created.length, 0)
+})
+
+await check("KEEPRUN_WORKERS env configures the pool", async () => {
+  const h = harness()
+  await start(h, "do X", { workersEnv: 0 })
+  assistant(h, "KEEPRUN_START")
+  await idle(h)
+  assert.doesNotMatch(promptText(h.prompts[0].body), /Parallel worker pool/)
+})
+
+await check("worker failures never stop the main loop", async () => {
+  const h = harness()
+  await start(h, "do X")
+  assistant(h, "KEEPRUN_START")
+  await idle(h)
+  assistant(h, "step\nKEEPRUN_WORKER: probe\nKEEPRUN_PLAN_READY")
+  await idle(h)
+  assert.equal(h.created.length, 1)
+  assistantError(h, { name: "APIError", data: { message: "worker boom" } }, "n1")
+  await idle(h, "n1")
+  assert.equal(stopped(h), false)
+  assert.ok(h.deleted.includes("n1"))
+  assistant(h, "done\nKEEPRUN_CONTINUE")
+  await idle(h)
+  assert.equal(lastPromptBody(h).agent, "keeprun-plan")
+})
+
+await check("stopping the main loop cleans up active workers", async () => {
+  const h = harness()
+  await start(h, "do X")
+  assistant(h, "KEEPRUN_START")
+  await idle(h)
+  assistant(h, "step\nKEEPRUN_WORKER: slow probe\nKEEPRUN_PLAN_READY")
+  await idle(h)
+  assert.equal(h.created.length, 1)
+  assistant(h, "KEEPRUN_DONE")
+  await idle(h)
+  assert.equal(stopped(h), true)
+  assert.ok(h.deleted.includes("n1"))
+})
+
+await check("--worker-model is passed to the worker", async () => {
+  const h = harness()
+  await start(h, "do X --worker-model=p/m")
+  assistant(h, "KEEPRUN_START")
+  await idle(h)
+  assistant(h, "step\nKEEPRUN_WORKER: probe\nKEEPRUN_PLAN_READY")
+  await idle(h)
+  const wp = h.prompts.find((p) => p.sessionID === "n1")
+  assert.deepEqual(wp.body.model, { providerID: "p", modelID: "m" })
+})
+
+await check("--workers flags are stripped from the task", async () => {
+  const h = harness()
+  await start(h, "do X --workers=2 --worker-model=p/m")
+  const ack = promptText({ parts: h.output.parts })
+  assert.match(ack, /Task: do X/)
+  assert.doesNotMatch(ack, /--workers|--worker-model/)
 })
 
 await rm(goalDir, { recursive: true, force: true })

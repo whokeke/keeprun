@@ -1,9 +1,19 @@
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises"
-import { basename, isAbsolute, join, resolve } from "node:path"
+import { basename, dirname, isAbsolute, join, resolve } from "node:path"
 
 type ModelRef = { providerID: string; modelID: string }
 
 type Phase = "ack" | "plan" | "build" | "handoff" | "summary"
+
+type WorkerReport = { task: string; report: string; path?: string; at: number; seen: boolean }
+
+type WorkerRec = {
+  sid: string
+  owner: St
+  task: string
+  lastAssistantID?: string
+  watchdog?: ReturnType<typeof setTimeout>
+}
 
 type St = {
   active: boolean
@@ -26,6 +36,9 @@ type St = {
   stopReason?: string
   pendingStop?: string
   summaryPath?: string
+  workers: number
+  workerModel?: ModelRef
+  workerReports: WorkerReport[]
   cycles: number
   maxCycles: number
   budgetMs?: number
@@ -43,6 +56,13 @@ type St = {
 
 const PLAN_AGENT = "keeprun-plan"
 const BUILD_AGENT = "build"
+const WORKER_AGENT = "keeprun-worker"
+const DEFAULT_WORKERS = 1
+const MAX_WORKERS = 4
+const WORKER_TASK_CHAR_LIMIT = 500
+const WORKER_REPORT_CHAR_LIMIT = 4000
+const WORKER_REPORT_LIMIT = 8
+const WORKER_DONE_MARK = "KEEPRUN_WORKER_DONE"
 const DEFAULT_MAX_CYCLES = Infinity
 const CHALLENGER_EMPTY_LIMIT = 5
 const MAX_HANDOFFS = 5
@@ -109,6 +129,8 @@ function parseArgs(raw: string) {
   let watchdogInvalid = false
   let goal: string | undefined
   let out: string | undefined
+  let workers: number | undefined
+  let workerModel: ModelRef | undefined
   let task = raw || ""
   let aggressive = false
   if (/--aggressive(?:=\S*)?(\s|$)/.test(task)) {
@@ -145,8 +167,30 @@ function parseArgs(raw: string) {
     out = q1 !== undefined ? q1 : q2 !== undefined ? q2 : q3
     return ""
   })
+  task = task.replace(/--worker-model=(\S+)/g, (_, v) => {
+    workerModel = parseModel(v)
+    return ""
+  })
+  task = task.replace(/--workers=(\d+)/g, (_, v) => {
+    workers = Number(v)
+    return ""
+  })
   task = task.replace(/\s+/g, " ").trim()
-  return { task, planModel, buildModel, max, forMs, forInvalid, watchdogMs, watchdogInvalid, goal, out, aggressive }
+  return {
+    task,
+    planModel,
+    buildModel,
+    max,
+    forMs,
+    forInvalid,
+    watchdogMs,
+    watchdogInvalid,
+    goal,
+    out,
+    aggressive,
+    workers,
+    workerModel,
+  }
 }
 
 function unwrap(res: any): any {
@@ -212,6 +256,13 @@ export default async function Keeprun(input: any) {
   )
   const envRetry = Number(process.env.KEEPRUN_RETRY_MS)
   const retryBaseMs = Number.isFinite(envRetry) && envRetry > 0 ? envRetry : 2000
+  const envWorkers = Number(process.env.KEEPRUN_WORKERS)
+  const defaultWorkers =
+    Number.isFinite(envWorkers) && envWorkers >= 0
+      ? Math.min(MAX_WORKERS, Math.floor(envWorkers))
+      : DEFAULT_WORKERS
+  const envWorkerModel = parseModel(process.env.KEEPRUN_WORKER_MODEL)
+  const workers = new Map<string, WorkerRec>()
   const directory: string | undefined = input?.directory
 
   async function toast(message: string, variant: "info" | "success" | "warning" | "error" = "info") {
@@ -351,8 +402,8 @@ export default async function Keeprun(input: any) {
   async function writeDoc(st: St, name: string, body: string): Promise<string | undefined> {
     try {
       if (st.outDir) {
-        await mkdir(st.outDir, { recursive: true })
         const path = join(st.outDir, name)
+        await mkdir(dirname(path), { recursive: true })
         await writeFile(path, body, "utf8")
         return path
       }
@@ -381,6 +432,7 @@ export default async function Keeprun(input: any) {
       "duration: " + fmtDuration(Date.now() - st.startedAt),
       "cycles: " + st.cycles,
       "handoffs: " + st.handoffs,
+      "worker_reports: " + st.workerReports.length,
       "stop_reason: " + reason,
       "---",
       "",
@@ -399,6 +451,175 @@ export default async function Keeprun(input: any) {
       if (text) chunks.push(String(m?.info?.role || "?") + ": " + text.slice(0, 1200))
     }
     return chunks.length ? "Recent transcript:\n" + chunks.join("\n") : "Recent transcript: (unavailable)"
+  }
+
+  function parseWorkerTasks(text: string, max: number): string[] {
+    const out: string[] = []
+    const re = /^\s*KEEPRUN_WORKER:\s*(.+)$/gm
+    let current: RegExpExecArray | null
+    while ((current = re.exec(text)) && out.length < max) {
+      const task = current[1].trim().slice(0, WORKER_TASK_CHAR_LIMIT)
+      if (task && !out.includes(task)) out.push(task)
+    }
+    return out
+  }
+
+  function activeWorkers(owner: St): number {
+    let count = 0
+    for (const rec of workers.values()) if (rec.owner === owner) count += 1
+    return count
+  }
+
+  function armWorkerWatchdog(sid: string, rec: WorkerRec) {
+    if (rec.watchdog) clearTimeout(rec.watchdog)
+    rec.watchdog = setTimeout(() => {
+      const current = workers.get(sid)
+      if (!current || current !== rec) return
+      toast("worker timed out: " + rec.task.slice(0, 60), "warning").catch(() => {})
+      cleanupWorker(sid).catch(() => {})
+    }, rec.owner.watchdogMs)
+  }
+
+  async function cleanupWorker(sid: string) {
+    const rec = workers.get(sid)
+    if (rec?.watchdog) clearTimeout(rec.watchdog)
+    workers.delete(sid)
+    try {
+      await client.session.delete({ path: { id: sid } })
+    } catch {}
+  }
+
+  async function cleanupWorkers(st: St) {
+    for (const [sid, rec] of Array.from(workers.entries())) {
+      if (rec.owner === st) await cleanupWorker(sid)
+    }
+  }
+
+  async function spawnWorkers(st: St, tasks: string[]) {
+    const slots = Math.max(0, st.workers - activeWorkers(st))
+    for (const task of tasks.slice(0, slots)) {
+      let sid: string | undefined
+      try {
+        const res = await client.session.create({ body: { title: "keeprun worker: " + task.slice(0, 50) } })
+        if (failed(res)) throw res.error
+        sid = unwrap(res)?.id
+        if (!sid) throw new Error("session.create returned no id")
+      } catch (error) {
+        await toast("worker spawn failed: " + errText(error), "warning")
+        continue
+      }
+      const rec: WorkerRec = { sid, owner: st, task }
+      workers.set(sid, rec)
+      await setPermissions(sid, HARDEN)
+      armWorkerWatchdog(sid, rec)
+      const text = [
+        "KEEPRUN worker task (read-only research, runs in parallel with the main build step).",
+        "",
+        "Main task: " + st.task,
+        ...goalLines(st),
+        "",
+        "Investigation task:",
+        task,
+        "",
+        "You are READ-ONLY: never modify files or system state, never ask the user, never delegate.",
+        "Produce a concise findings report: concrete observations with file:line references, risks, missing tests, performance opportunities, and actionable suggestions. Do not attempt the main build step.",
+        "End with " + WORKER_DONE_MARK + " on its own final line.",
+      ].join("\n")
+      try {
+        const res = await client.session.promptAsync({
+          path: { id: sid },
+          body: {
+            agent: WORKER_AGENT,
+            ...(st.workerModel ? { model: st.workerModel } : {}),
+            parts: [{ type: "text", text }],
+          },
+        })
+        if (failed(res)) throw res.error
+      } catch (error) {
+        await toast("worker prompt failed: " + errText(error), "warning")
+        await cleanupWorker(sid)
+        continue
+      }
+      await toast("worker started: " + task.slice(0, 60), "info")
+    }
+  }
+
+  async function onWorkerIdle(sid: string) {
+    const rec = workers.get(sid)
+    if (!rec) return
+    const last = await lastAssistant(sid)
+    if (!last) return
+    const id = last.info?.id
+    if (!id || id === rec.lastAssistantID) return
+    rec.lastAssistantID = id
+    const error = last.info?.error
+    const text = (last.parts || [])
+      .filter((part: any) => part?.type === "text")
+      .map((part: any) => part.text || "")
+      .join("\n")
+    const report = text
+      .split(/\r?\n/)
+      .filter(
+        (line) =>
+          line
+            .trim()
+            .replace(/^[>*#`_\-\s]+/, "")
+            .replace(/[`_*\s]+$/, "") !== WORKER_DONE_MARK,
+      )
+      .join("\n")
+      .trim()
+      .slice(0, WORKER_REPORT_CHAR_LIMIT)
+    if (error) {
+      const name = error.name || error.data?.name
+      if (name !== "MessageAbortedError") await toast("worker failed: " + (name || "unknown"), "warning")
+    }
+    if (report) {
+      let path: string | undefined
+      if (rec.owner.outDir) {
+        path = await writeDoc(
+          rec.owner,
+          "workers/worker-" + stamp() + "-" + sid.slice(-6) + ".md",
+          "# worker findings\n\nTask: " + rec.task + "\n\n" + report + "\n",
+        )
+      }
+      rec.owner.workerReports.push({ task: rec.task, report, path, at: Date.now(), seen: false })
+      if (rec.owner.workerReports.length > WORKER_REPORT_LIMIT) rec.owner.workerReports.shift()
+      await toast("worker findings ready (" + rec.task.slice(0, 40) + ")" + (path ? ": " + path : ""), "success")
+    }
+    await cleanupWorker(sid)
+  }
+
+  function workerFindings(st: St): string[] {
+    const unseen = st.workerReports.filter((report) => !report.seen)
+    if (!unseen.length) return []
+    for (const report of unseen) report.seen = true
+    const lines = ["", "Worker findings (parallel read-only research):"]
+    for (const report of unseen.slice(-3)) {
+      lines.push("- Task: " + report.task)
+      lines.push("  " + report.report.slice(0, 800).replace(/\n/g, "\n  "))
+      if (report.path) lines.push("  Full report: " + report.path)
+    }
+    return lines
+  }
+
+  function workerTaskLines(st: St): string[] {
+    if (st.workers <= 0) return []
+    return [
+      "",
+      "Parallel worker pool: " + st.workers + " read-only worker session(s) can run alongside the build step.",
+      "If useful, append up to " + st.workers + " line(s) starting with:",
+      "KEEPRUN_WORKER: <self-contained read-only investigation task that supports the ultimate goal>",
+      "Keep the main step independent of worker results; they report back next round.",
+    ]
+  }
+
+  function workerReportLines(st: St): string[] {
+    if (!st.workerReports.length) return []
+    return [
+      "",
+      "Worker reports collected during this run (" + st.workerReports.length + "):",
+      ...st.workerReports.map((report) => "- " + report.task.slice(0, 100) + (report.path ? " -> " + report.path : "")),
+    ]
   }
 
   function aggressiveAllowsStop(reason: string): boolean {
@@ -458,12 +679,15 @@ export default async function Keeprun(input: any) {
     st.active = false
     clearWatchdog(st)
     clearRetry(st)
+    await cleanupWorkers(st)
     const finalReason = st.stopReason || reason
     if (st.summaryOn && !st.summaryPath) {
       const body =
         metaHeader(st, finalReason) +
         "# keeprun 总结（插件生成）\n\n停止原因：" +
         finalReason +
+        "\n" +
+        workerReportLines(st).join("\n") +
         "\n\n" +
         (await transcriptBlock(sessionID, st)) +
         "\n"
@@ -553,6 +777,8 @@ export default async function Keeprun(input: any) {
       "State: " + progress,
       ...(left ? ["Time budget remaining: " + left + ". Keep making concrete progress until the budget is exhausted."] : []),
       ...(note ? ["", note] : []),
+      ...workerFindings(st),
+      ...workerTaskLines(st),
       "",
       "Produce the single next concrete step that requires no user decision.",
       "You are read-only: do not modify anything and do not ask questions.",
@@ -576,6 +802,7 @@ export default async function Keeprun(input: any) {
       ...goalLines(st),
       "",
       ...(left ? ["Time budget remaining: " + left + ". Keep making concrete progress until the budget is exhausted."] : []),
+      ...(st.workers > 0 ? ["Ignore any KEEPRUN_WORKER: lines in the planner's message; those tasks run in parallel workers."] : []),
       "Execute exactly the next step described in the planner's last message above.",
       "Work autonomously: do not ask questions, make reasonable assumptions, and verify the result (build/tests) before finishing.",
       "If the ENTIRE task is complete and verified, end with KEEPRUN_DONE on its own final line.",
@@ -599,6 +826,8 @@ export default async function Keeprun(input: any) {
       ...goalLines(st),
       "",
       "The previous objective was reported complete (KEEPRUN_DONE), but the time budget still has " + left + " remaining. Do not stop.",
+      ...workerFindings(st),
+      ...workerTaskLines(st),
       "Judge progress against the ULTIMATE GOAL above and keep pushing toward it.",
       "Act as a strict adversarial reviewer of everything done so far in this conversation.",
       "Interrogate the result: what is untested, fragile, incomplete, slow, insecure, or unclear? What would a demanding reviewer reject? What follow-up work is genuinely valuable for reaching the ultimate goal?",
@@ -641,6 +870,7 @@ export default async function Keeprun(input: any) {
         fmtDuration(Date.now() - st.startedAt) +
         ".",
       st.deadline ? "Time budget remaining at stop: " + fmtDuration(Math.max(0, st.deadline - Date.now())) + "." : "",
+      ...workerReportLines(st),
       "",
       "Write the final summary document for the user, in the same language as the task (default Chinese). Sections:",
       "1. 结论：对照最终目标，本次运行达成到什么程度。",
@@ -890,6 +1120,10 @@ export default async function Keeprun(input: any) {
         return
       }
       if (st.phase === "plan") {
+        if (st.workers > 0) {
+          const tasks = parseWorkerTasks(text, st.workers)
+          if (tasks.length) await spawnWorkers(st, tasks)
+        }
         if (mark === MARK_BLOCKED) return await stop(sessionID, st, "needs human decision (planner)")
         if (mark === MARK_DONE) {
           if (!st.deadline) return await stop(sessionID, st, "task complete (planner)")
@@ -965,6 +1199,11 @@ export default async function Keeprun(input: any) {
       const aggressive = parsed.aggressive || envAggressive
       const explicitMax = parsed.max && parsed.max > 0 ? parsed.max : undefined
       const maxCycles = aggressive ? Infinity : explicitMax ?? defaultMax
+      const workerCount =
+        parsed.workers !== undefined
+          ? Math.max(0, Math.min(MAX_WORKERS, Math.floor(parsed.workers)))
+          : defaultWorkers
+      const workerModel = parsed.workerModel ?? envWorkerModel
       const taskText = parsed.task || "(continue the current conversation task)"
       if (aggressive && !budgetMs) {
         await toast("aggressive mode without --for: the run continues until /keepstop", "warning")
@@ -983,7 +1222,10 @@ export default async function Keeprun(input: any) {
       }
 
       const previous = states.get(sessionID)
-      if (previous) clearWatchdog(previous)
+      if (previous) {
+        clearWatchdog(previous)
+        await cleanupWorkers(previous)
+      }
       const st: St = {
         active: true,
         phase: "ack",
@@ -998,6 +1240,9 @@ export default async function Keeprun(input: any) {
         watchdogMs,
         aggressive,
         retries: 0,
+        workers: workerCount,
+        workerModel,
+        workerReports: [],
         outDir,
         summaryOn: outDir ? true : !summaryDisabled,
         summarizing: false,
@@ -1051,8 +1296,9 @@ export default async function Keeprun(input: any) {
       const goalLabel = st.goalPath ? ", goal " + basename(st.goalPath) : ""
       const docsLabel = st.outDir ? ", docs " + st.outDir : ""
       const aggressiveLabel = st.aggressive ? ", AGGRESSIVE" : ""
+      const workersLabel = st.workers > 0 ? ", " + st.workers + " worker(s)" : ""
       await toast(
-        "keeprun active (plan " + planLabel + ", " + capLabel + budgetLabel + goalLabel + docsLabel + aggressiveLabel + ")",
+        "keeprun active (plan " + planLabel + ", " + capLabel + budgetLabel + goalLabel + docsLabel + aggressiveLabel + workersLabel + ")",
         "success",
       )
     },
@@ -1075,16 +1321,31 @@ export default async function Keeprun(input: any) {
         const props = event.properties || {}
         if (ACTIVITY_EVENTS.includes(event.type)) {
           const sid = props.sessionID || props.part?.sessionID || props.info?.sessionID
-          const st = sid ? states.get(sid) : undefined
+          if (!sid) return
+          const rec = workers.get(sid)
+          if (rec) {
+            armWorkerWatchdog(sid, rec)
+            return
+          }
+          const st = states.get(sid)
           if (st && st.active) armWatchdog(sid, st)
           return
         }
         if (event.type === "session.idle") {
+          if (workers.has(props.sessionID)) {
+            await onWorkerIdle(props.sessionID)
+            return
+          }
           await onIdle(props.sessionID)
           return
         }
         if (event.type === "session.error") {
           if (!props.sessionID) return
+          if (workers.has(props.sessionID)) {
+            await toast("worker error: " + errText(props.error), "warning")
+            await cleanupWorker(props.sessionID)
+            return
+          }
           const st = states.get(props.sessionID)
           if (!st || !st.active) return
           if (isContextError(props.error)) {
@@ -1100,10 +1361,17 @@ export default async function Keeprun(input: any) {
         if (event.type === "session.deleted") {
           const id = props.info?.id
           if (!id) return
+          if (workers.has(id)) {
+            const rec = workers.get(id)
+            if (rec?.watchdog) clearTimeout(rec.watchdog)
+            workers.delete(id)
+            return
+          }
           const st = states.get(id)
           if (st) {
             clearWatchdog(st)
             clearRetry(st)
+            await cleanupWorkers(st)
             states.delete(id)
             if (st.summaryOn && !st.summaryPath) {
               const reason = st.stopReason || "session deleted"

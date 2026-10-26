@@ -35,6 +35,7 @@ opencode 原生在每一轮 assistant 回复结束后进入 `idle`，等待用�
 | 上下文溢出 | 识别 `ContextOverflowError`/溢出文本 → 自动 compact → 强模型写交接文档 → **新建 session** 继续同一 keeprun（`MAX_HANDOFFS=5`） |
 | 运行文档 | `--out=<dir>`：本次运行全部文档收集到 `<dir>/run-<时间戳>/`（`goal.md`/`handoff-<N>.md`/`summary.md`）；缺省仅把 `summary-<时间戳>.md` 写到工作区根 |
 | 结束总结 | 任一停止路径先派发**总结轮**（强模型按模板撰写，失败机械兜底），落盘后 toast/恢复提示给出路径，再真正停止 |
+| 并行 worker | 默认 1 个只读探索 worker（`--workers=N` 0–4）：规划器每轮可输出 `KEEPRUN_WORKER:` 行，插件在派发 build 轮的同时用独立会话执行，发现回注下一轮 plan 并落盘 `<out>/workers/*.md` |
 | 规划模型 | 默认 `deepseek/GLM-5.3`，可通过参数/环境变量/agent 文件修改 |
 | 实施阶段 | 内置 `build` agent + `/keeprun` 前的**原模型** |
 | 零打断加固 | `doom_loop: allow` + `question: deny`（keeprun 会话级） |
@@ -186,6 +187,9 @@ type St = {
   aggressive: boolean       // 激进模式：除预算/手动停止外一律继续
   retries: number           // 激进模式连续自救次数（用于退避）
   retryTimer?: Timeout      // 待执行的继续计时器
+  workers: number           // 并行 worker 槽位数（默认 1，0–4）
+  workerModel?: ModelRef    // worker 模型（缺省用 agent 文件默认）
+  workerReports: WorkerReport[] // 最近 8 条 worker 发现（task/report/path/seen）
   outDir?: string           // --out 解析出的本次运行文档目录
   summaryOn: boolean        // 是否生成总结（--out 隐含开启；KEEPRUN_SUMMARY=off 关闭默认路径）
   summarizing: boolean      // stop() 已转入总结阶段，防重入
@@ -303,7 +307,10 @@ type St = {
 | `sendPlan` | 设置 `phase=plan`，注入规划消息 |
 | `sendBuild` | 设置 `phase=build`，注入实施消息 |
 | `dispatch` | 调 `promptAsync`，设置看门狗，处理失败 |
-| `stop` | 停用状态、去加固、必要时恢复原 agent/model |
+| `parseWorkerTasks` / `spawnWorkers` | 从规划器输出解析 `KEEPRUN_WORKER:` 行并并发派发只读 worker 会话 |
+| `onWorkerIdle` / `cleanupWorker(s)` | worker 报告捕获（截断、落盘、入 `workerReports`）与清理；worker 失败/超时仅告警，不影响主循环 |
+| `workerFindings` / `workerTaskLines` / `workerReportLines` | plan/challenge 提示词注入发现、worker 槽位提示、summary 中列出报告 |
+| `stop` | 停用状态、去加固、必要时恢复原 agent/model；激进模式下大部分原因转入 `keepGoing` |
 | `restoreSession` | 用 `noReply` 消息把会话切回 `build + 原模型` |
 | `onIdle` | 状态机核心：去重、错误判定、标记判定、阶段推进 |
 | `markerOf` | 只在最后 6 个非空行里识别标记，避免正文误判 |
@@ -319,6 +326,8 @@ type St = {
 | `KEEPRUN_CONTINUE` | build 轮 | 本步完成但任务未结束（插件即使没看到也默认继续） |
 | `KEEPRUN_HANDOFF` | handoff 轮 | 交接文档结束标记（插件也会直接取该轮文本作为文档） |
 | `KEEPRUN_SUMMARY` | summary 轮 | 结束总结文档结束标记 |
+| `KEEPRUN_WORKER: <任务>` | plan/challenger 轮 | 行内协议：给并行只读 worker 的调查任务（最多 N 行） |
+| `KEEPRUN_WORKER_DONE` | worker 轮 | worker 报告结束标记 |
 
 判定规则（`markerOf`）：
 
@@ -350,6 +359,7 @@ type St = {
 - 完成但预算未耗尽：`KEEPRUN_DONE` 不停止，转入追问者轮；追问者连续 5 轮（`CHALLENGER_EMPTY_LIMIT`）仍无产出才停止（`challenger found no further work`），防止空转烧 token。
 - 上下文溢出：`ContextOverflowError` 事件只标记不停止（opencode 自动 compact 并继续）；ai 消息上的溢出错误触发一次 compact 后交接；交接最多 5 次（`MAX_HANDOFFS`），超出停止（`too many context handoffs`）。
 - 交接失败（`session.create` 失败）→ 停止并提示；旧会话始终解除加固并提示新会话 id。
+- 并行 worker：`session.idle/error/activity/deleted` 事件先按 `workers` 表路由；worker 完成捕获报告（去标记、≤4KB、保留 8 条、`--out` 落盘 `workers/worker-*.md`）→ 删会话；worker 失败/超时只告警+删除，**绝不停止主循环**；主循环停止/交接替换时清理其全部 worker。
 - 结束总结：所有停止路径先进入 `summary` 阶段（强模型撰写，元数据头由插件写入）；总结轮失败/超时/会话删除 → 机械兜底，保证落盘；`KEEPRUN_SUMMARY=off` 且无 `--out` 时跳过总结轮。
 - 手动 `/keepstop`：置 `pendingStop`，本轮 idle 时转入停止+总结（不再直接置 `active=false`）。
 
@@ -471,6 +481,9 @@ KEEPRUN is being stopped. Confirm in one short sentence and do not start new wor
 | 运行文档目录 | 无（仅工作区根 summary） | `--out=<dir>`；或环境变量 `KEEPRUN_OUT`；自动建 `run-<时间戳>/` 子目录 |
 | 结束总结 | 开 | `KEEPRUN_SUMMARY=off` 关闭默认总结；显式 `--out` 视为开启 |
 | 看门狗（静默超时） | 2 小时 | `--watchdog=<时长>`；或环境变量 `KEEPRUN_WATCHDOG`；会话活动自动重置 |
+| 并行 worker | 1（0–4） | `--workers=N`；或环境变量 `KEEPRUN_WORKERS` |
+| worker 模型 | 同规划模型 | `--worker-model=provider/model`；或 `KEEPRUN_WORKER_MODEL`；agent 文件 `agents/keeprun-worker.md` 内置默认 |
+| worker 报告上限 | 8 条 / 4KB | 常量 `WORKER_REPORT_LIMIT` / `WORKER_REPORT_CHAR_LIMIT` |
 
 优先级：命令行参数 > 环境变量 > agent frontmatter。
 
@@ -495,6 +508,8 @@ KEEPRUN is being stopped. Confirm in one short sentence and do not start new wor
 11. **文档与仓库污染**：`--out` 目录（含 `run-*` 子目录）由使用者选择；缺省总结写在**工作区根** `summary-<时间戳>.md`，如不希望入库请加入 `.gitignore` 或改用 `--out` 指向忽略目录。
 12. **激进模式没有内置兜底**：不给 `--for` 时会一直运行到 `/keepstop`；持续错误会按退避重试（2s→60s），可能持续消耗 token，适合“跑到时间到”的场景。
 13. **轮数默认无限**：没有 `--max` 时，唯一的自动停止来源是完成标记、时间预算或显式停止条件；长任务请配合 `--for` 使用。
+14. **worker 只读但有 bash**：探索 worker 的"只读"靠 agent 权限（edit/write/apply_patch/task/question deny）+ 提示约束，与内置 plan 一致，无法绝对防止写命令；worker 会话在 TUI 需手动切换查看，toast 会提示，报告落 `<out>/workers/`。
+15. **worker 并发成本**：默认 1 个 worker 意味着每轮 plan 最多多一次并发 LLM 调用；`--workers=0` 可关闭。
 
 ---
 
@@ -546,8 +561,9 @@ opencode debug config
 - 停止原因必显：无需恢复时也写 `KEEPRUN stopped (<原因>)`；
 - 默认轮数无限（25 轮不停止）；`KEEPRUN_MAX_CYCLES` 仍可显式设限；
 - 激进模式：BLOCKED / assistant 错误 / 看门狗静默 → 不停止并按退避重新派发 plan；忽略 `--max`；时间预算到期与 `/keepstop` 仍停止；`KEEPRUN_AGGRESSIVE` 环境变量生效。
+- 并行 worker：默认 1 个；规划器输出 `KEEPRUN_WORKER:` 行 → 并发建只读会话（agent `keeprun-worker`、模型可配）→ 报告捕获/落盘/回注下一轮 plan → 会话删除；`--workers=0`/环境变量关闭；worker 出错不影响主循环；主循环停止时清理 worker。
 
-全部通过（39 项）。仓库内测试：`node test/state-machine.test.mjs`。
+全部通过（46 项）。仓库内测试：`node test/state-machine.test.mjs`。
 
 ---
 

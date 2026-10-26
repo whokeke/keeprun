@@ -54,10 +54,14 @@ curl -fsSL https://raw.githubusercontent.com/whokeke/keeprun/main/uninstall.sh |
 | `--goal="text"` / `--goal=@file.md` | the task text | or `KEEPRUN_GOAL`. `@` reads a goal document (relative to the worktree, capped at 16 KB); it is snapshotted at start and must not change during the run |
 | `--out=<dir>` | workspace root (summary only) | or `KEEPRUN_OUT`. Collects all run documents in `<dir>/run-<timestamp>/`: `goal.md`, `handoff-<N>.md`, `summary.md`. `KEEPRUN_SUMMARY=off` disables the default summary |
 | `--watchdog=<duration>` | 2h | or `KEEPRUN_WATCHDOG`. Inactivity timeout, not a per-round limit: any session activity (message/part updates, status) resets it, so long build rounds are never killed. It only stops when the session is silent for the whole window |
+| `--workers=N` | 1 | or `KEEPRUN_WORKERS` (0–4). Read-only parallel research workers. The planner can emit `KEEPRUN_WORKER: <task>` lines; each runs in its own session while the build step runs, and findings feed the next plan round (`<out>/workers/worker-*.md` with `--out`) |
+| `--worker-model=provider/model` | the plan model | or `KEEPRUN_WORKER_MODEL`. Model used by the `keeprun-worker` agent |
 
 Time budget details: the remaining time is included in every plan/build prompt; when the budget is exhausted the loop stops with `time budget exhausted`; if the challenger returns `KEEPRUN_DONE` five consecutive times with no intervening build work, it stops with `challenger found no further work` to avoid burning tokens. Without `--aggressive`, `KEEPRUN_BLOCKED` stops immediately (missing credentials or a genuine human decision cannot be resolved autonomously); with `--aggressive` the blocker is handed back to the planner with an explicit "assume reasonable defaults and work around it" directive.
 
 Aggressive details: it is meant for "run until the clock runs out" sessions. Start it with a time budget (e.g. `--for=8h`); without one it runs until `/keepstop`. Retries back off exponentially up to 60s, and a context handoff cap is reset instead of stopping.
+
+Worker details: one read-only `keeprun-worker` session (default) is available per run. During a long compile or benchmark wait, the planner can dispatch up to N investigation tasks; workers are spawned as separate sessions (own context, deleted after one task), harden themselves, and their findings are injected into the next plan round and collected under `--out` as `<out>/workers/worker-*.md`. Worker failures, timeouts and results never stop or block the main loop. Workers are read-only by permission; they still have `bash`, so "read-only" is prompt-constrained like the built-in plan mode.
 
 Stop visibility: every stop reason is written into the transcript as a synthetic note (`KEEPRUN stopped (<reason>)`), plus a 6-second toast and, when documents are enabled, a summary file — nothing disappears silently.
 

@@ -5,6 +5,7 @@ DEST="${KEEPRUN_DEST:-${HOME}/.config/opencode}"
 
 FILES=(
   "agents/keeprun-plan.md"
+  "agents/keeprun-worker.md"
   "plugins/keeprun.ts"
   "command/keeprun.md"
   "command/keepstop.md"
