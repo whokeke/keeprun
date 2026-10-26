@@ -526,24 +526,6 @@ await check("/keepstop stops after the round and writes a summary", async () => 
   await rm(outBase, { recursive: true, force: true })
 })
 
-await check("failed summary round falls back to a plugin-generated summary", async () => {
-  const outBase = await mkdtemp(join(tmpdir(), "keeprun-out-"))
-  const h = harness()
-  await start(h, "do X --out=" + outBase)
-  assistant(h, "KEEPRUN_START")
-  await idle(h)
-  assistant(h, "KEEPRUN_DONE")
-  await idle(h)
-  assert.match(promptText(lastPromptBody(h)), /KEEPRUN summary phase/)
-  assistantError(h, { name: "APIError", data: { message: "boom" } })
-  await idle(h)
-  const summary = await readFile(join(await runDirOf(outBase), "summary.md"), "utf8")
-  assert.match(summary, /keeprun 总结（插件生成）/)
-  assert.match(summary, /stop_reason: task complete/)
-  assert.equal(stopped(h), true)
-  await rm(outBase, { recursive: true, force: true })
-})
-
 await check("summary is written to the workspace root without --out", async () => {
   const base = await mkdtemp(join(tmpdir(), "keeprun-base-"))
   const h = harness()
@@ -878,6 +860,77 @@ await check("normal mode surfaces a silent dispatch failure", async () => {
   assert.match(String(lastToast(h).message), /stopped: dispatch produced no response/)
   const users = h.messagesFor("s1").filter((m) => m.info.role === "user")
   assert.match(promptText({ parts: users.at(-1).parts }), /KEEPRUN stopped \(dispatch produced no response/)
+})
+
+await check("failed summary round retries with the build model then falls back", async () => {
+  const outBase = await mkdtemp(join(tmpdir(), "keeprun-out-"))
+  const h = harness()
+  await start(h, "do X --out=" + outBase + " --build-model=b/m")
+  assistant(h, "KEEPRUN_START")
+  await idle(h)
+  assistant(h, "KEEPRUN_DONE")
+  await idle(h)
+  assert.match(promptText(lastPromptBody(h)), /KEEPRUN summary phase/)
+  assert.equal(lastPromptBody(h).agent, "keeprun-plan")
+  // first summary attempt fails (plan model) -> build-model retry
+  assistantError(h, { name: "APIError", data: { message: "boom" } })
+  await idle(h)
+  const retry = lastPromptBody(h)
+  assert.equal(retry.agent, "build")
+  assert.deepEqual(retry.model, { providerID: "b", modelID: "m" })
+  assert.match(promptText(retry), /planning model was unavailable/)
+  // retry succeeds -> LLM summary written
+  assistant(h, "REAL SUMMARY\nKEEPRUN_SUMMARY")
+  await idle(h)
+  const summary = await readFile(join(await runDirOf(outBase), "summary.md"), "utf8")
+  assert.match(summary, /REAL SUMMARY/)
+  assert.doesNotMatch(summary, /keeprun 总结（插件生成）/)
+  assert.equal(stopped(h), true)
+  await rm(outBase, { recursive: true, force: true })
+})
+
+await check("double summary failure falls back to the mechanical summary", async () => {
+  const outBase = await mkdtemp(join(tmpdir(), "keeprun-out-"))
+  const h = harness()
+  await start(h, "do X --out=" + outBase)
+  assistant(h, "KEEPRUN_START")
+  await idle(h)
+  assistant(h, "KEEPRUN_DONE")
+  await idle(h)
+  assistantError(h, { name: "APIError", data: { message: "boom" } })
+  await idle(h)
+  assert.equal(lastPromptBody(h).agent, "build")
+  assistantError(h, { name: "APIError", data: { message: "boom again" } })
+  await idle(h)
+  const summary = await readFile(join(await runDirOf(outBase), "summary.md"), "utf8")
+  assert.match(summary, /keeprun 总结（插件生成）/)
+  assert.match(summary, /stop_reason: task complete/)
+  assert.equal(stopped(h), true)
+  await rm(outBase, { recursive: true, force: true })
+})
+
+await check("dashscope parameter-invalid error triggers handoff, not retry", async () => {
+  const outBase = await mkdtemp(join(tmpdir(), "keeprun-out-"))
+  const h = harness()
+  await start(h, "do X --aggressive --out=" + outBase + " --build-model=b/m")
+  assistant(h, "KEEPRUN_START")
+  await idle(h)
+  assistantError(h, {
+    name: "APIError",
+    data: {
+      message:
+        "litellm.BadRequestError: DashscopeException - A parameter specified in the request is not valid Request id: 0217929",
+    },
+  })
+  await idle(h)
+  // aggressive mode must NOT keep retrying; it compacts and hands off
+  assert.ok(h.summarized.length === 1, "summarize (compact) called")
+  assert.match(promptText(lastPromptBody(h)), /KEEPRUN handoff phase/)
+  assistant(h, "HANDOFF BODY\nKEEPRUN_HANDOFF")
+  await idle(h)
+  assert.equal(h.created.length, 1)
+  assert.equal(stopped(h), false)
+  await rm(outBase, { recursive: true, force: true })
 })
 
 await rm(goalDir, { recursive: true, force: true })

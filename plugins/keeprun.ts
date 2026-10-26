@@ -37,6 +37,7 @@ type St = {
   pendingStop?: string
   summaryPath?: string
   pendingRound?: boolean
+  summaryFallback?: boolean
   workers: number
   workerModel?: ModelRef
   workerReports: WorkerReport[]
@@ -71,7 +72,8 @@ const GOAL_DOC_CHAR_LIMIT = 16 * 1024
 const DEFAULT_WATCHDOG_MS = 2 * 60 * 60 * 1000
 const ACTIVITY_EVENTS = ["message.updated", "message.part.delta", "message.part.updated", "session.status"]
 
-const CONTEXT_ERROR_RE = /context limit|exceeds the context|context length|too many tokens|maximum context/i
+const CONTEXT_ERROR_RE =
+  /context limit|exceeds the context|context length|too many tokens|maximum context|parameter specified in the request is not valid/i
 const HANDOFF_MARK = "KEEPRUN_HANDOFF"
 const SUMMARY_MARK = "KEEPRUN_SUMMARY"
 
@@ -680,6 +682,7 @@ export default async function Keeprun(input: any) {
     st.active = false
     clearWatchdog(st)
     clearRetry(st)
+    st.pendingRound = false
     await cleanupWorkers(st)
     const finalReason = st.stopReason || reason
     if (st.summaryOn && !st.summaryPath) {
@@ -854,7 +857,7 @@ export default async function Keeprun(input: any) {
     })
   }
 
-  async function sendSummary(sessionID: string, st: St, reason: string) {
+  async function sendSummary(sessionID: string, st: St, reason: string, useBuild = false) {
     st.phase = "summary"
     await checkGoalChanged(st)
     const text = [
@@ -881,16 +884,29 @@ export default async function Keeprun(input: any) {
       "4. 未完成事项与后续建议（按优先级）。",
       "5. 遇到的问题与坑。",
       "",
+      ...(useBuild ? ["You are the build model writing this summary as a fallback (the planning model was unavailable)."] : []),
       "You are read-only; do not modify anything. Output markdown only.",
       "End with " + SUMMARY_MARK + " on its own final line.",
     ]
       .filter(Boolean)
       .join("\n")
+    const agent = useBuild ? BUILD_AGENT : PLAN_AGENT
+    const model = useBuild ? st.buildModel : st.planModel
     await dispatch(sessionID, st, {
-      agent: PLAN_AGENT,
-      ...(st.planModel ? { model: st.planModel } : {}),
+      agent,
+      ...(model ? { model } : {}),
       parts: [{ type: "text", text }],
     })
+  }
+
+  async function handleSummaryFailure(sessionID: string, st: St) {
+    st.pendingRound = false
+    if (!st.summaryFallback) {
+      st.summaryFallback = true
+      await toast("summary round failed; retrying with the build model", "warning")
+      return await sendSummary(sessionID, st, st.stopReason || "stopped", true)
+    }
+    return await finishStop(sessionID, st, st.stopReason || "stopped")
   }
 
   async function sendHandoff(sessionID: string, st: St) {
@@ -1036,8 +1052,9 @@ export default async function Keeprun(input: any) {
     try {
       const last = await lastAssistant(sessionID)
       const noNewAssistant = !last || !last.info?.id || last.info.id === st.lastAssistantID
-      if (noNewAssistant && st.pendingRound && !st.summarizing) {
+      if (noNewAssistant && st.pendingRound) {
         st.pendingRound = false
+        if (st.summarizing) return await handleSummaryFailure(sessionID, st)
         const reason = "dispatch produced no response (provider/stream failure)"
         if (st.aggressive) return await keepGoing(sessionID, st, reason)
         return await stop(sessionID, st, reason)
@@ -1067,10 +1084,13 @@ export default async function Keeprun(input: any) {
             return await migrateToNewSession(sessionID, st, await fallbackHandoff(sessionID, st))
           }
           if (st.phase === "summary") {
-            return await stop(sessionID, st, st.stopReason || "summary failed (context limit)")
+            return await handleSummaryFailure(sessionID, st)
           }
           return await startHandoff(sessionID, st, true)
         } else {
+          if (st.phase === "summary") {
+            return await handleSummaryFailure(sessionID, st)
+          }
           return await stop(sessionID, st, "assistant error: " + (name || "unknown"))
         }
       }
